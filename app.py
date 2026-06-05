@@ -113,6 +113,31 @@ def parse_nl(text):
                        _CVE.search(t)   or any(w in t for w in IOC_WORDS))
     is_ttp_content  = any(w in t for w in TTP_WORDS)
 
+    # Triage intent — "what should I look at first", "triage", prioritize
+    TRIAGE_WORDS = ["triage", "what should i", "what needs", "look at first",
+                    "prioriti", "what to investigate", "rundown of alerts",
+                    "overview of alerts", "summarize alerts", "summarise alerts",
+                    "where to start", "what is important", "what's important"]
+    if any(w in t for w in TRIAGE_WORDS):
+        out["intent"] = "triage"
+        m = _re.search(r"(\d+)\s*(day|days|d\b)", t)
+        if m:
+            out["hours"] = int(m.group(1)) * 24
+        else:
+            m = _re.search(r"(\d+)\s*(h\b|hr\b|hour|hours)", t)
+            if m:          out["hours"] = int(m.group(1))
+            elif "week"  in t: out["hours"] = 168
+            elif "today" in t: out["hours"] = 24
+            else:              out["hours"] = 24
+        am = _re.search(r"\bagent\s+(?:id\s+)?(\d{1,3})\b", t)
+        if am: out["agent"] = am.group(1).zfill(3)
+        period = (f"last {out['hours']//24}d" if out["hours"]>=24 and out["hours"]%24==0
+                  else f"last {out['hours']}h")
+        out["notes"] = [period]
+        if out["agent"]: out["notes"].append(f"agent {out['agent']}")
+        out["summary"] = "  |  ".join(out["notes"])
+        return out
+
     # Threat-category intent — high-level analyst questions.
     # These map to bundles of detection patterns (a whole attack class).
     THREAT_PATTERNS = {
@@ -548,6 +573,55 @@ def inventory_route():
     except Exception as e:
         log.exception("Inventory error")
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/triage", methods=["POST"])
+def triage_route():
+    data     = request.get_json() or {}
+    hours    = int(data.get("hours", 24))
+    agent_id = (data.get("agent") or "").strip() or None
+    try:
+        result = ag.triage(hours=hours, agent_id=agent_id)
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report = _triage_to_text(result)
+        with ST.hist_lock:
+            ST.history[run_id] = {
+                "id": run_id, "label": f"TRIAGE: last {hours}h",
+                "started": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "ended":   datetime.now().strftime("%H:%M"),
+                "status":  "completed", "report": report,
+            }
+            ST._save_history()
+        result["run_id"] = run_id
+        return jsonify(result)
+    except Exception as e:
+        log.exception("Triage error")
+        return jsonify({"error": str(e)}), 500
+
+
+def _triage_to_text(d):
+    if d.get("error"): return f"TRIAGE\nError: {d['error']}"
+    lines = [f"ALERT TRIAGE — last {d['hours']}h",
+             f"{d['total']} alerts grouped into {d['situations']} situations", ""]
+    for bucket, title in [("urgent","URGENT — investigate now"),
+                          ("review","REVIEW — needs a look"),
+                          ("routine","ROUTINE / LIKELY NOISE")]:
+        items = d.get(bucket, [])
+        if not items: continue
+        lines.append(f"{title} ({len(items)})")
+        for s in items:
+            agents = ", ".join(s["agents"][:3])
+            tac    = ", ".join(s["tactics"][:3]) if s["tactics"] else "no tactic"
+            lines.append(f"- [{s['max_level']}] {s['group']}  "
+                         f"({s['count']} events, {agents})  [{tac}]")
+            if s.get("reason"):
+                lines.append(f"    Why: {s['reason']}")
+            if s.get("focus"):
+                lines.append(f"    Look at: {'; '.join(s['focus'])}")
+            if s.get("action"):
+                lines.append(f"    Action: {s['action']}")
+        lines.append("")
+    return "\n".join(lines)
 
 
 @app.route("/threat", methods=["POST"])
@@ -1194,10 +1268,11 @@ function parseAndConfirm() {
     const isHunt   = d.intent === 'hunt_ioc' || d.intent === 'hunt_ttp';
     const isInv    = d.intent === 'inventory';
     const isThreat = d.intent === 'threat_category';
-    const label  = isThreat ? 'Threat Hunt' : isInv ? 'Inventory'
-                 : isHunt ? 'Hunt' : 'Investigate';
-    const color  = isThreat ? '#db6d28' : isInv ? '#a371f7'
-                 : isHunt ? '#1f6feb' : '#238636';
+    const isTriage = d.intent === 'triage';
+    const label  = isTriage ? 'Triage' : isThreat ? 'Threat Hunt'
+                 : isInv ? 'Inventory' : isHunt ? 'Hunt' : 'Investigate';
+    const color  = isTriage ? '#bf4080' : isThreat ? '#db6d28'
+                 : isInv ? '#a371f7' : isHunt ? '#1f6feb' : '#238636';
     p.innerHTML =
         '<div style="margin-bottom:8px">'
       + '<strong style="color:' + color + '">' + label + '</strong>'
@@ -1222,7 +1297,9 @@ function confirmRun() {
   const d = _pendingAction;
   document.getElementById('nl-preview').style.display = 'none';
   if (!d) { startRun(); return; }
-  if (d.intent === 'threat_category') {
+  if (d.intent === 'triage') {
+    runTriage(d.hours || 24, d.agent || '');
+  } else if (d.intent === 'threat_category') {
     runThreatHunt(d.threat_cat, d.hours || 24, d.agent || '');
   } else if (d.intent === 'inventory') {
     runInventory(d.inv_kind, d.agent || '', d.only_suspicious || false);
@@ -1236,6 +1313,117 @@ function confirmRun() {
   }
 }
 
+
+function runTriage(hours, agent) {
+  _stoppable = false;
+  document.getElementById('nl-preview').style.display = 'none';
+  const out = document.getElementById('live-out');
+  out.classList.remove('md-body');
+  _liveBuffer = '';
+  document.getElementById('live-title').textContent = 'Alert Triage';
+  document.getElementById('dot').className = 'live-dot running';
+  setRunning(true);
+  out.innerHTML = '<div style="color:#8b949e;font-size:12px;padding:8px 0">'
+    + 'Triaging alerts across last ' + hours + 'h (scoring by severity, '
+    + 'MITRE tags, density, and rarity)...</div>';
+
+  fetch('/triage', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({hours, agent: agent||null})
+  })
+  .then(r => r.json())
+  .then(d => {
+    document.getElementById('dot').className = 'live-dot';
+    setRunning(false);
+    if (d.error) {
+      out.innerHTML = '<div style="color:#f85149">Error: ' + esc(d.error) + '</div>';
+      return;
+    }
+    _liveBuffer = _formatTriage(d);
+    out.innerHTML = _liveBuffer;
+    _loadHistoryData();
+  })
+  .catch(e => {
+    setRunning(false);
+    document.getElementById('dot').className = 'live-dot error';
+    out.innerHTML = '<div style="color:#f85149">Request failed: ' + e + '</div>';
+  });
+}
+
+function _formatTriage(d) {
+  let html = '<div style="font-size:15px;font-weight:600;color:#bf4080;margin-bottom:4px">'
+           + 'Alert Triage</div>';
+
+  if (d.total === 0) {
+    html += '<div style="color:#3fb950;font-size:13px;padding:10px 0">'
+          + '✓ No alerts in the last ' + d.hours + 'h. Nothing to triage.</div>';
+    return html;
+  }
+
+  html += '<div style="color:#8b949e;font-size:12px;margin-bottom:14px">'
+        + d.total + ' alerts grouped into ' + d.situations + ' situations '
+        + '<span style="color:#484f58">· last ' + d.hours + 'h</span></div>';
+
+  const buckets = [
+    ['urgent', 'URGENT — investigate now', '#f85149', '🔴'],
+    ['review', 'REVIEW — needs a look',     '#f0883e', '🟠'],
+    ['routine','ROUTINE / LIKELY NOISE',    '#3fb950', '🟢'],
+  ];
+
+  buckets.forEach(([key, title, color, dot]) => {
+    const items = d[key] || [];
+    if (!items.length) return;
+    html += '<div style="font-size:11px;font-weight:700;color:' + color + ';'
+          + 'text-transform:uppercase;letter-spacing:.5px;margin:16px 0 8px">'
+          + dot + ' ' + title + ' (' + items.length + ')</div>';
+    items.forEach(s => {
+      const agents  = s.agents.slice(0,3).join(', ');
+      const tactics = s.tactics.length ? s.tactics.slice(0,3).join(', ') : 'no MITRE tactic';
+      const lc = (s.max_level>=13)?'#f85149':(s.max_level>=10)?'#f0883e':'#8b949e';
+      const sample = s.sample || {};
+      const sdesc  = sample['rule.description'] || (s.top_rules[0] || '');
+      const focusList = (s.focus || []).map(f =>
+        '<li style="margin:1px 0">' + esc(f) + '</li>').join('');
+      html += '<div style="background:#161b22;border:1px solid #21262d;'
+            + 'border-left:3px solid ' + color + ';border-radius:4px;'
+            + 'padding:10px 12px;margin-bottom:8px">'
+            // Header: group name + score
+            + '<div style="display:flex;justify-content:space-between;align-items:center">'
+            + '<span style="color:#e6edf3;font-size:13px;font-weight:600">'
+            + esc(s.group) + '</span>'
+            + '<span style="font-size:10px;color:#484f58">score ' + s.score + '</span>'
+            + '</div>'
+            // Metadata line
+            + '<div style="font-size:11px;color:#8b949e;margin-top:3px">'
+            + '<span style="color:' + lc + '">[sev ' + s.max_level + ']</span>'
+            + ' · ' + s.count + ' events · ' + esc(agents)
+            + ' · <span style="color:#a371f7">' + esc(tactics) + '</span>'
+            + '</div>'
+            // Sample rule
+            + (sdesc ? '<div style="font-size:11px;color:#6e7681;margin-top:3px;'
+               + 'font-family:monospace">' + esc(sdesc) + '</div>' : '')
+            // WHY
+            + (s.reason ? '<div style="font-size:11px;margin-top:8px">'
+               + '<span style="color:#8b949e;font-weight:600">Why: </span>'
+               + '<span style="color:#c9d1d9">' + esc(s.reason) + '</span></div>' : '')
+            // WHAT TO LOOK AT
+            + (focusList ? '<div style="font-size:11px;margin-top:5px">'
+               + '<span style="color:#8b949e;font-weight:600">Look at:</span>'
+               + '<ul style="margin:2px 0 0;padding-left:18px;color:#c9d1d9">'
+               + focusList + '</ul></div>' : '')
+            // ACTION
+            + (s.action ? '<div style="font-size:11px;margin-top:6px;'
+               + 'color:' + color + '">▸ ' + esc(s.action) + '</div>' : '')
+            + '</div>';
+    });
+  });
+
+  html += '<div style="font-size:10px;color:#484f58;margin-top:14px;'
+        + 'border-top:1px solid #21262d;padding-top:8px">'
+        + 'Scored by: severity + MITRE-tag presence + event density − rarity penalty. '
+        + 'No hardcoded scenarios. Investigate any situation for full behavior analysis.</div>';
+  return html;
+}
 
 function runThreatHunt(category, hours, agent) {
   _stoppable = false;
