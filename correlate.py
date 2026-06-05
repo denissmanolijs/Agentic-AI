@@ -1086,6 +1086,300 @@ def _hunt_ttp(query, days, agent_id=None):
 
 
 
+
+# ── Alert Triage ──────────────────────────────────────────────────────────────
+# Scores and buckets all alerts by URGENCY using signals derived from the
+# data itself — NOT a hardcoded scenario catalog. Adapts to any environment.
+#
+# Score = severity + behavior-confidence + chain-density + mitre-presence
+#         - noise-penalty (how common this rule is in the baseline window)
+#
+# Weights are configurable via .env so analysts can tune per environment.
+
+TRIAGE_WEIGHTS = {
+    "severity":  float(os.getenv("TRIAGE_W_SEVERITY",  "1.0")),
+    "behavior":  float(os.getenv("TRIAGE_W_BEHAVIOR",  "4.0")),
+    "chain":     float(os.getenv("TRIAGE_W_CHAIN",     "0.5")),
+    "mitre":     float(os.getenv("TRIAGE_W_MITRE",     "2.0")),
+    "noise":     float(os.getenv("TRIAGE_W_NOISE",     "3.0")),
+}
+
+def _rule_baseline_freq(rule_groups, baseline_days=30):
+    """How often does this rule group fire over the baseline window?
+    Used for rarity scoring — common rules get a noise penalty.
+    Returns events-per-day rate."""
+    since = (datetime.now(timezone.utc) - timedelta(days=baseline_days)).isoformat()
+    q = {"bool":{"must":[{"range":{"timestamp":{"gte":since}}},
+                         {"match":{"rule.groups":rule_groups}}]}}
+    try:
+        agg = ix_agg(q, {"c":{"value_count":{"field":"rule.level"}}})
+        total = agg.get("c",{}).get("value",0)
+        return total / max(baseline_days,1)
+    except Exception:
+        return 0.0
+
+
+# High-risk tactics that warrant immediate attention when present
+_HIGH_RISK_TACTICS = {"Privilege Escalation", "Credential Access",
+                      "Lateral Movement", "Exfiltration", "Command and Control",
+                      "Defense Evasion", "Impact"}
+
+def _triage_insight(grp, count, max_lv, tactics, daily_rate, top_rules):
+    """
+    Derive a human-readable WHY and WHAT-TO-LOOK-AT from data signals only.
+    No hardcoded scenario catalog — text is composed from the signal pattern.
+    Returns (reason, action, focus).
+    """
+    high_risk = [t for t in tactics if t in _HIGH_RISK_TACTICS]
+    is_common = daily_rate > 50
+    is_rare   = daily_rate < 1 and count >= 3   # rare but clustered
+
+    # ── WHY does this need a look (reason) ───────────────────────────────────
+    parts = []
+    if max_lv >= 12:
+        parts.append(f"high-severity (level {max_lv})")
+    elif max_lv >= 7:
+        parts.append(f"medium-severity (level {max_lv})")
+    else:
+        parts.append(f"low-severity (level {max_lv})")
+
+    if high_risk:
+        parts.append(f"tagged with {', '.join(high_risk)}")
+    if count >= 15:
+        parts.append(f"high volume ({count} events — a sustained burst, not a one-off)")
+    elif count >= 5:
+        parts.append(f"{count} related events")
+
+    if is_rare:
+        parts.append("rarely seen in your environment (anomalous)")
+    elif is_common:
+        parts.append(f"very common (~{int(daily_rate)}/day — usually routine)")
+
+    reason = "; ".join(parts).capitalize() + "."
+
+    # ── WHAT to look at (focus) — derived from tactic + rule signals ─────────
+    focus = []
+    rule_txt = " ".join(top_rules).lower()
+
+    if "Privilege Escalation" in tactics or "Persistence" in tactics:
+        if "service" in rule_txt:
+            focus.append("the new service's ImagePath and whether it was authorized")
+        if "scheduled task" in rule_txt or "taskschd" in rule_txt:
+            focus.append("the scheduled task definition and what it executes")
+        if "registry" in rule_txt:
+            focus.append("the registry key modified and its value")
+    if "Credential Access" in tactics:
+        focus.append("which account was targeted and the source process")
+    if "Lateral Movement" in tactics:
+        focus.append("the source and destination hosts, and the account used")
+    if "Command and Control" in tactics or "Execution" in tactics:
+        if "script" in rule_txt or "powershell" in rule_txt:
+            focus.append("the script content and where it was dropped")
+        if "cmd" in rule_txt or "command" in rule_txt:
+            focus.append("the exact command line executed")
+    if "Defense Evasion" in tactics:
+        if "disconnect" in rule_txt:
+            focus.append("why the agent disconnected — possible tampering")
+        if "delete" in rule_txt or "cleared" in rule_txt:
+            focus.append("what was deleted and by which process")
+    if not focus:
+        focus.append("the event timeline and the process that triggered it")
+
+    # ── WHAT to do (action) ──────────────────────────────────────────────────
+    if max_lv >= 12 and high_risk:
+        action = "Investigate this agent now — run a full investigation."
+    elif high_risk and count >= 10:
+        action = "Run an investigation on this agent to see the full attack chain."
+    elif is_common and max_lv < 7:
+        action = "Likely routine. Dismiss unless it correlates with a higher-priority situation."
+    elif is_rare:
+        action = "Unusual pattern — worth a closer look even at low severity."
+    else:
+        action = "Review the sample events; investigate if the context looks unexpected."
+
+    return reason, action, focus
+
+def triage(hours=24, agent_id=None, min_sev=3):
+    """
+    Triage all alerts in the window. Returns prioritized situation buckets.
+    No hardcoded scenarios — scoring is derived from live data signals.
+    """
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+
+    # 1. Pull aggregated alert groups (reuses the same aggregation as fetch_alerts)
+    must = [{"range":{"timestamp":{"gte":since}}},
+            {"range":{"rule.level":{"gte":min_sev}}}]
+    if agent_id:
+        must.append({"term":{"agent.id":agent_id}})
+    q = {"bool":{"must":must}}
+
+    agg = ix_agg(q, {
+        "total":    {"value_count":{"field":"rule.level"}},
+        "by_group": {"terms":{"field":"rule.groups","size":50,
+                              "order":{"max_lv":"desc"}},
+                     "aggs":{"max_lv":   {"max":{"field":"rule.level"}},
+                             "count":    {"value_count":{"field":"rule.level"}},
+                             "agents":   {"terms":{"field":"agent.name","size":5}},
+                             "tactics":  {"terms":{"field":"rule.mitre.tactic","size":5}},
+                             "top_rules":{"terms":{"field":"rule.description","size":3}},
+                             "sample":   {"top_hits":{"size":1,
+                                          "sort":[{"rule.level":{"order":"desc"}}],
+                                          "_source":["timestamp","agent.name",
+                                          "rule.description","rule.level"]}}}},
+    })
+
+    total_alerts = agg.get("total",{}).get("value",0)
+    groups       = agg.get("by_group",{}).get("buckets",[])
+
+    if total_alerts == 0:
+        return {"mode":"triage","hours":hours,"total":0,"situations":[],
+                "urgent":[], "review":[], "routine":[]}
+
+    W = TRIAGE_WEIGHTS
+    situations = []
+
+    for g in groups:
+        grp_name = g["key"]
+        count    = g["count"]["value"]
+        max_lv   = g["max_lv"]["value"] or 0
+        agents   = [b["key"] for b in g.get("agents",{}).get("buckets",[])]
+        tactics  = [b["key"] for b in g.get("tactics",{}).get("buckets",[])]
+        rules    = [b["key"] for b in g.get("top_rules",{}).get("buckets",[])]
+        sample_h = g.get("sample",{}).get("hits",{}).get("hits",[])
+        sample   = sample_h[0]["_source"] if sample_h else {}
+
+        # ── Score from data-derived signals ──────────────────────────────────
+        # Severity: normalized 0-1 (Wazuh levels go to ~15)
+        sev_score = (max_lv / 15.0) * W["severity"]
+
+        # MITRE presence: does the data label this with a tactic?
+        mitre_score = (W["mitre"] if tactics else 0.0)
+
+        # Chain density: more events in the group = denser situation (log scale)
+        import math as _m
+        chain_score = _m.log10(count + 1) * W["chain"]
+
+        # Rarity / noise: how common is this rule group in the baseline?
+        # Common rules (high daily rate) get penalized.
+        daily_rate  = _rule_baseline_freq(grp_name)
+        # Normalize: >100/day = very noisy, demote heavily
+        noise_penalty = min(daily_rate / 100.0, 1.0) * W["noise"]
+
+        # Behavior confidence would require pulling the chain per group —
+        # expensive. We approximate using severity + tactic presence here,
+        # and the analyst can Investigate any group for full behavior detection.
+
+        score = sev_score + mitre_score + chain_score - noise_penalty
+
+        reason, action, focus = _triage_insight(
+            grp_name, count, max_lv, tactics, daily_rate, rules)
+
+        situations.append({
+            "group":       grp_name,
+            "count":       count,
+            "max_level":   max_lv,
+            "agents":      agents,
+            "tactics":     tactics,
+            "top_rules":   rules,
+            "sample":      sample,
+            "daily_rate":  round(daily_rate, 1),
+            "score":       round(score, 2),
+            "reason":      reason,
+            "action":      action,
+            "focus":       focus,
+        })
+
+    # Sort by score, highest first
+    situations.sort(key=lambda s: s["score"], reverse=True)
+
+    # ── Bucket by score thresholds (relative + absolute) ─────────────────────
+    # Absolute floors based on severity ensure a true crit is always urgent
+    urgent, review, routine = [], [], []
+    for s in situations:
+        if s["max_level"] >= 12 and s["score"] > 0:
+            urgent.append(s)
+        elif s["score"] >= 1.0:
+            review.append(s)
+        else:
+            routine.append(s)
+
+    return {
+        "mode":        "triage",
+        "hours":       hours,
+        "total":       total_alerts,
+        "situations":  len(situations),
+        "urgent":      urgent,
+        "review":      review,
+        "routine":     routine,
+    }
+
+
+
+def triage_insights_llm(situations):
+    """
+    Generator: takes Python-scored situations and streams an LLM analysis.
+    ONE model call. The LLM writes a verdict + recommendation per situation.
+    Yields text chunks (the raw model output) for SSE streaming.
+    Python keeps the scoring/bucketing — the LLM only adds judgment.
+    """
+    if not situations:
+        yield "No situations to analyse."
+        return
+
+    # Build a compact summary of each situation — NOT raw events.
+    lines = []
+    for i, s in enumerate(situations, 1):
+        agents  = ", ".join(s.get("agents", [])[:3]) or "unknown"
+        tactics = ", ".join(s.get("tactics", [])) or "none"
+        rules   = "; ".join(s.get("top_rules", [])[:2])
+        rate    = s.get("daily_rate", 0)
+        lines.append(
+            f"{i}. GROUP: {s['group']}\n"
+            f"   Severity: {s['max_level']} | Events: {s['count']} | "
+            f"Agents: {agents}\n"
+            f"   MITRE tactics: {tactics}\n"
+            f"   Rules: {rules}\n"
+            f"   Baseline rate: {rate}/day "
+            f"({'common/likely-noise' if rate > 50 else 'rare/notable' if rate < 1 else 'occasional'})"
+        )
+    situations_block = "\n\n".join(lines)
+
+    system = (
+        "You are a senior SOC analyst doing alert triage. You are given "
+        "pre-grouped, pre-scored alert situations. For EACH situation, give a "
+        "one-line verdict and a concrete recommendation. Be specific and brief. "
+        "Plain text only, no markdown. Do NOT re-score or re-order — the priority "
+        "is already decided. Focus on WHAT this likely is and WHAT the analyst "
+        "should do. Use the exact format below for every situation."
+    )
+    user = (
+        f"Here are {len(situations)} alert situations to triage:\n\n"
+        f"{situations_block}\n\n"
+        f"For each numbered situation, respond in exactly this format:\n"
+        f"[n] VERDICT: <one line: likely benign / suspicious / needs investigation / "
+        f"likely attack>\n"
+        f"    WHY: <one line — what the evidence suggests>\n"
+        f"    DO: <one line — the specific next action>\n"
+    )
+
+    client = ollama.Client(host=C["OL_HOST"])
+    try:
+        for chunk in client.chat(
+            model=C["MODEL"],
+            messages=[{"role": "system", "content": system},
+                      {"role": "user",   "content": user}],
+            stream=True,
+            options={"temperature": 0, "num_ctx": 8192, "num_predict": 1500},
+        ):
+            if STOP_FLAG.is_set():
+                break
+            txt = chunk.message.content
+            if txt:
+                yield txt
+    except Exception as e:
+        yield f"\n[LLM analysis unavailable: {e}]"
+
+
 # ── Threat Category Hunt ──────────────────────────────────────────────────────
 # Maps high-level analyst questions to bundles of detection patterns.
 # Each category searches rule.description (keyword field → wildcards) and
