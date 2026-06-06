@@ -27,6 +27,12 @@ C = {
     "IX_PASS": os.getenv("INDEXER_PASS",  "admin"),
     "MODEL":   os.getenv("OLLAMA_MODEL",  "qwen2.5:3b"),
     "OL_HOST": os.getenv("OLLAMA_HOST",   "http://localhost:11434"),
+    # Agentic mode (used by agent_tools.py) — kept here so all config
+    # lives in ONE place and .env is read once.
+    "AGENTIC_MODEL": os.getenv("AGENTIC_MODEL", os.getenv("OLLAMA_MODEL", "qwen2.5:14b-instruct")),
+    "AGENTIC_MAX_STEPS": int(os.getenv("AGENTIC_MAX_STEPS", "18")),
+    "UI_PORT": int(os.getenv("UI_PORT", "5000")),
+    "UI_HOST": os.getenv("UI_HOST", "0.0.0.0"),
 }
 SSL     = os.getenv("WAZUH_SSL","false").lower() == "true"
 MIN_SEV = int(os.getenv("MIN_SEVERITY","3"))
@@ -58,10 +64,24 @@ NL = "\n"
 def _auth():
     global _tok, _tok_exp
     if not _tok or time.time() >= _tok_exp-60:
-        r = requests.post(f"{C['HOST']}/security/user/authenticate",
-                          auth=(C['USER'],C['PASSWD']), verify=SSL, timeout=10)
-        r.raise_for_status()
-        _tok, _tok_exp = r.json()["data"]["token"], time.time()+890
+        # Wazuh's authenticate endpoint can intermittently 500 under load —
+        # retry a few times with backoff before giving up.
+        last_err = None
+        for attempt in range(4):
+            try:
+                r = requests.post(f"{C['HOST']}/security/user/authenticate",
+                                  auth=(C['USER'],C['PASSWD']), verify=SSL, timeout=10)
+                if r.status_code == 500:
+                    last_err = "500 from authenticate endpoint"
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                r.raise_for_status()
+                _tok, _tok_exp = r.json()["data"]["token"], time.time()+890
+                return {"Authorization": f"Bearer {_tok}"}
+            except requests.exceptions.RequestException as e:
+                last_err = str(e)
+                time.sleep(1.5 * (attempt + 1))
+        raise RuntimeError(f"Wazuh auth failed after retries: {last_err}")
     return {"Authorization": f"Bearer {_tok}"}
 
 def wget(path, params=None):
