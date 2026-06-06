@@ -1,16 +1,4 @@
 """
-agent_tools.py — Agentic (tool-calling) mode for the Wazuh Correlation Agent.
-
-This is the "real agentic" path the community asked for: the LLM decides which
-Wazuh queries to run, reads the results, and iterates until it can answer —
-rather than regex routing to a fixed query.
-
-It is ISOLATED from correlate.py's deterministic path on purpose:
-  - Low-resource users keep the fast, deterministic regex+template flow.
-  - GPU users with a tool-capable model (qwen3.5, llama3.1+, etc.) get this.
-
-Every tool call the model makes is logged, preserving the SIEM audit trail.
-
 Run standalone for testing:
     python3 agent_tools.py "is there data exfiltration on my endpoints?"
     python3 agent_tools.py --agent 001 "what is this host doing that's unusual?"
