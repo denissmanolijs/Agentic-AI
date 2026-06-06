@@ -27,6 +27,12 @@ C = {
     "IX_PASS": os.getenv("INDEXER_PASS",  "admin"),
     "MODEL":   os.getenv("OLLAMA_MODEL",  "qwen2.5:3b"),
     "OL_HOST": os.getenv("OLLAMA_HOST",   "http://localhost:11434"),
+    # Agentic mode (used by agent_tools.py) — kept here so all config
+    # lives in ONE place and .env is read once.
+    "AGENTIC_MODEL": os.getenv("AGENTIC_MODEL", os.getenv("OLLAMA_MODEL", "qwen2.5:14b-instruct")),
+    "AGENTIC_MAX_STEPS": int(os.getenv("AGENTIC_MAX_STEPS", "18")),
+    "UI_PORT": int(os.getenv("UI_PORT", "5000")),
+    "UI_HOST": os.getenv("UI_HOST", "0.0.0.0"),
 }
 SSL     = os.getenv("WAZUH_SSL","false").lower() == "true"
 MIN_SEV = int(os.getenv("MIN_SEVERITY","3"))
@@ -58,10 +64,24 @@ NL = "\n"
 def _auth():
     global _tok, _tok_exp
     if not _tok or time.time() >= _tok_exp-60:
-        r = requests.post(f"{C['HOST']}/security/user/authenticate",
-                          auth=(C['USER'],C['PASSWD']), verify=SSL, timeout=10)
-        r.raise_for_status()
-        _tok, _tok_exp = r.json()["data"]["token"], time.time()+890
+        # Wazuh's authenticate endpoint can intermittently 500 under load —
+        # retry a few times with backoff before giving up.
+        last_err = None
+        for attempt in range(4):
+            try:
+                r = requests.post(f"{C['HOST']}/security/user/authenticate",
+                                  auth=(C['USER'],C['PASSWD']), verify=SSL, timeout=10)
+                if r.status_code == 500:
+                    last_err = "500 from authenticate endpoint"
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                r.raise_for_status()
+                _tok, _tok_exp = r.json()["data"]["token"], time.time()+890
+                return {"Authorization": f"Bearer {_tok}"}
+            except requests.exceptions.RequestException as e:
+                last_err = str(e)
+                time.sleep(1.5 * (attempt + 1))
+        raise RuntimeError(f"Wazuh auth failed after retries: {last_err}")
     return {"Authorization": f"Bearer {_tok}"}
 
 def wget(path, params=None):
@@ -777,6 +797,769 @@ def call_llm(alert, evidence, chain):
     print("\n" + report)
     log.info("Report done: %d chars, risk=%s", len(report), risk)
     return report
+
+
+
+# ── Inventory (syscollector snapshot) ─────────────────────────────────────────
+# Read-only host inventory queries — no LLM, fast, factual.
+# Optionally flags suspicious findings (odd ports, hacking tools).
+
+_SUSPECT_PORTS = {4444:"Metasploit default", 1337:"common backdoor",
+                  31337:"Back Orifice", 12345:"NetBus", 5555:"ADB/remote",
+                  6666:"IRC botnet", 6667:"IRC botnet", 8080:"proxy/alt-http"}
+
+# Suspect tool names. Matched as whole words (regex \b boundaries) so that
+# legitimate processes like "mDNSResponder" don't false-positive on "responder".
+_SUSPECT_PKG = ["nmap","netcat","ncat","mimikatz","metasploit","sqlmap",
+                "hydra","wireshark","tcpdump","psexec",
+                "powersploit","cobaltstrike","bloodhound","impacket",
+                "sharphound","rubeus","kerbrute","crackmapexec","secretsdump",
+                "winpeas","linpeas","seatbelt","certify"]
+
+import re as _re_susp
+# Pre-compile word-boundary patterns. "responder" alone is too broad
+# (matches mDNSResponder) so it is intentionally excluded — use a more
+# specific indicator if hunting for the Responder tool.
+_SUSPECT_RE = _re_susp.compile(
+    r"\b(" + "|".join(_re_susp.escape(s) for s in _SUSPECT_PKG) + r")\b",
+    _re_susp.IGNORECASE)
+
+def _is_suspect(text):
+    """Whole-word match against the suspect tool list."""
+    return bool(_SUSPECT_RE.search(text or ""))
+
+def inventory(kind, agent_id, only_suspicious=False):
+    """
+    kind: "packages" | "ports" | "processes" | "files"
+    only_suspicious: if True, return ONLY flagged/suspicious items.
+    Returns a structured dict with the raw data and any flagged items.
+    """
+    if not agent_id:
+        return {"error": "Inventory queries require an agent ID"}
+
+    aid = agent_id.zfill(3)
+
+    try:
+        if kind == "ports":
+            r     = wget(f"/syscollector/{aid}/ports", {"limit": 200})
+            items = r.get("affected_items", [])
+            rows, flags = [], []
+            for p in items:
+                port  = p.get("local", {}).get("port")
+                proto = p.get("protocol", "")
+                state = p.get("state", "")
+                proc  = p.get("process", "?")
+                sus   = port in _SUSPECT_PORTS
+                rows.append({"port": port, "protocol": proto,
+                             "state": state, "process": proc, "_sus": sus})
+                if sus:
+                    flags.append(f"Port {port} ({_SUSPECT_PORTS[port]}) — {proc}")
+            if only_suspicious:
+                rows = [r for r in rows if r.get("_sus")]
+            return {"kind": "ports", "agent": aid, "count": len(rows),
+                    "rows": rows, "flags": flags,
+                    "only_suspicious": only_suspicious}
+
+        elif kind == "processes":
+            r     = wget(f"/syscollector/{aid}/processes", {"limit": 300})
+            items = r.get("affected_items", [])
+            rows, flags = [], []
+            for p in items:
+                name = p.get("name", "")
+                pid  = p.get("pid", "")
+                ppid = p.get("ppid", "")
+                cmd  = p.get("cmd", "") or p.get("command", "")
+                low  = (name + " " + cmd).lower()
+                sus  = _is_suspect(low)
+                rows.append({"name": name, "pid": pid, "ppid": ppid,
+                             "cmd": cmd[:120], "_sus": sus})
+                if sus:
+                    flags.append(f"{name} (PID {pid}) — {cmd[:80]}")
+            if only_suspicious:
+                rows = [r for r in rows if r.get("_sus")]
+            else:
+                rows = rows[:100]
+            return {"kind": "processes", "agent": aid, "count": len(rows),
+                    "rows": rows, "flags": flags,
+                    "only_suspicious": only_suspicious}
+
+        elif kind == "packages":
+            r     = wget(f"/syscollector/{aid}/packages", {"limit": 500})
+            items = r.get("affected_items", [])
+            rows, flags = [], []
+            for p in items:
+                name    = p.get("name", "")
+                version = p.get("version", "")
+                vendor  = p.get("vendor", "")
+                sus     = _is_suspect(name)
+                rows.append({"name": name, "version": version,
+                             "vendor": vendor, "_sus": sus})
+                if sus:
+                    flags.append(f"{name} {version} ({vendor})")
+            if only_suspicious:
+                rows = [r for r in rows if r.get("_sus")]
+            return {"kind": "packages", "agent": aid, "count": len(rows),
+                    "rows": rows, "flags": flags,
+                    "only_suspicious": only_suspicious}
+
+        elif kind == "files":
+            r     = wget(f"/syscheck/{aid}", {"limit": 200})
+            items = r.get("affected_items", [])
+            rows, flags = [], []
+            SUSP_PATH = ["/tmp", "/dev/shm", "appdata", "\\temp",
+                         "system32", "\\run", "startup"]
+            for f in items:
+                path  = f.get("file", "")
+                mtime = f.get("mtime", "") or f.get("date", "")
+                sha   = f.get("sha256", "") or f.get("sha1", "")
+                sus   = any(s in path.lower() for s in SUSP_PATH)
+                rows.append({"file": path, "mtime": str(mtime)[:19],
+                             "hash": sha[:16], "_sus": sus})
+                if sus:
+                    flags.append(f"{path}  (modified {str(mtime)[:19]})")
+            if only_suspicious:
+                rows = [r for r in rows if r.get("_sus")]
+            else:
+                rows = rows[:100]
+            return {"kind": "files", "agent": aid, "count": len(rows),
+                    "rows": rows, "flags": flags,
+                    "only_suspicious": only_suspicious}
+
+        else:
+            return {"error": f"Unknown inventory kind: {kind}"}
+
+    except Exception as e:
+        return {"error": str(e), "kind": kind, "agent": aid}
+
+
+# ── Threat Hunt ───────────────────────────────────────────────────────────────
+
+# Known IOC patterns
+import re as _re_hunt
+_IP_RE   = _re_hunt.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
+_HASH_RE = _re_hunt.compile(r"^[0-9a-fA-F]{32,64}$")
+_CVE_RE  = _re_hunt.compile(r"CVE-\d{4}-\d+", _re_hunt.IGNORECASE)
+
+# TTP keyword → OpenSearch field mapping
+TTP_MAP = {
+    # Pass-the-hash / credential access
+    "pass the hash":       [{"wildcard":{"rule.description":{"value":"*pass-the-hash*","case_insensitive":True}}},
+                            {"match":{"rule.groups":"authentication_failed"}}],
+    "pth":                 [{"wildcard":{"rule.description":{"value":"*pass-the-hash*","case_insensitive":True}}}],
+    "credential dump":     [{"wildcard":{"rule.description":{"value":"*credential*","case_insensitive":True}}},
+                            {"wildcard":{"data.win.eventdata.image":{"value":"*lsass*","case_insensitive":True}}}],
+    "mimikatz":            [{"wildcard":{"data.win.eventdata.image":{"value":"*mimikatz*","case_insensitive":True}}},
+                            {"wildcard":{"rule.description":{"value":"*mimikatz*","case_insensitive":True}}}],
+    # Lateral movement
+    "lateral movement":    [{"match":{"rule.groups":"impacket"}},
+                            {"wildcard":{"rule.description":{"value":"*lateral*","case_insensitive":True}}}],
+    "psexec":              [{"wildcard":{"data.win.eventdata.image":{"value":"*psexec*","case_insensitive":True}}},
+                            {"wildcard":{"rule.description":{"value":"*psexec*","case_insensitive":True}}}],
+    "wmi":                 [{"wildcard":{"data.win.eventdata.image":{"value":"*wmiprvse*","case_insensitive":True}}},
+                            {"match":{"rule.groups":"impacket"}}],
+    # Persistence
+    "scheduled task":      [{"wildcard":{"rule.description":{"value":"*scheduled task*","case_insensitive":True}}},
+                            {"match":{"data.win.system.eventID":"4698"}}],
+    "registry persistence":[{"wildcard":{"rule.description":{"value":"*registry*","case_insensitive":True}}},
+                            {"wildcard":{"rule.description":{"value":"*persistence*","case_insensitive":True}}}],
+    "new service":         [{"match":{"data.win.system.eventID":"4697"}},
+                            {"wildcard":{"rule.description":{"value":"*new service*","case_insensitive":True}}}],
+    # Defense evasion
+    "process injection":   [{"wildcard":{"rule.description":{"value":"*process injection*","case_insensitive":True}}},
+                            {"match":{"rule.groups":"sysmon_eid10_detections"}}],
+    "powershell":          [{"wildcard":{"data.win.eventdata.image":{"value":"*powershell*","case_insensitive":True}}},
+                            {"wildcard":{"rule.description":{"value":"*powershell*","case_insensitive":True}}}],
+    # Discovery
+    "port scan":           [{"wildcard":{"rule.description":{"value":"*port scan*","case_insensitive":True}}},
+                            {"wildcard":{"rule.description":{"value":"*nmap*","case_insensitive":True}}}],
+    "reconnaissance":      [{"wildcard":{"rule.description":{"value":"*recon*","case_insensitive":True}}},
+                            {"wildcard":{"rule.description":{"value":"*enumeration*","case_insensitive":True}}}],
+    # Execution
+    "script drop":         [{"wildcard":{"rule.description":{"value":"*script*","case_insensitive":True}}},
+                            {"wildcard":{"rule.description":{"value":"*dropped*","case_insensitive":True}}}],
+    "malware":             [{"wildcard":{"rule.description":{"value":"*malware*","case_insensitive":True}}},
+                            {"wildcard":{"rule.description":{"value":"*trojan*","case_insensitive":True}}}],
+}
+
+def _hunt_ioc(value, days, agent_id=None):
+    """Search for an IP, hash, domain, or CVE.
+    Uses wildcard (case-insensitive) since description/full_log are keyword fields."""
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    must  = [{"range":{"timestamp":{"gte":since}}}]
+    if agent_id:
+        must.append({"term":{"agent.id": agent_id}})
+
+    if _IP_RE.match(value):    hunt_type = "IP Address"
+    elif _HASH_RE.match(value): hunt_type = "File Hash"
+    elif _CVE_RE.match(value):  hunt_type = "CVE"
+    else:                       hunt_type = "Indicator"
+
+    v = value.lower()
+    should = [
+        {"wildcard": {"full_log":         {"value": f"*{v}*", "case_insensitive": True}}},
+        {"wildcard": {"rule.description": {"value": f"*{v}*", "case_insensitive": True}}},
+        {"match":    {"data.srcip": value}},
+        {"match":    {"data.dstip": value}},
+    ]
+    q = {"bool": {"must": must, "should": should, "minimum_should_match": 1}}
+
+    log.info("HUNT IOC value=%r type=%s days=%d", value, hunt_type, days)
+
+    aggs = {
+        "by_agent": {"terms": {"field": "agent.id", "size": 20},
+                     "aggs":  {"name":  {"terms": {"field": "agent.name", "size": 1}},
+                               "first": {"min":   {"field": "timestamp"}},
+                               "last":  {"max":   {"field": "timestamp"}}}},
+        "total":    {"value_count": {"field": "rule.level"}},
+    }
+    agg_result = ix_agg(q, aggs)
+    hits       = ix_search(q, size=10, sort=[{"timestamp": {"order": "desc"}}])
+    total = agg_result.get("total", {}).get("value", 0)
+    log.info("HUNT IOC result: total=%d", total)
+
+    return {
+        "hunt_type": hunt_type,
+        "value":     value,
+        "days":      days,
+        "total":     total,
+        "by_agent":  agg_result.get("by_agent", {}).get("buckets", []),
+        "samples":   hits.get("hits", []),
+    }
+
+
+def _hunt_ttp(query, days, agent_id=None):
+    """Search for a TTP by keyword.
+    NOTE: rule.description is a KEYWORD field in this index, so `match`
+    does not work — only `wildcard` (lowercase) matches. Confirmed via diagnostics.
+    """
+    since  = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    must   = [{"range": {"timestamp": {"gte": since}}}]
+    if agent_id:
+        must.append({"term": {"agent.id": agent_id}})
+
+    q_lower  = query.lower().strip()
+    ttp_name = query
+
+    # rule.description is a KEYWORD field, so we use case_insensitive wildcard.
+    # For multi-word queries, match each word independently (AND) so word order
+    # and filler words between them do not break the match.
+    # "cis benchmark" matches "CIS Benchmark for Amazon Linux..." correctly.
+    words = [w for w in q_lower.split() if len(w) > 1]
+
+    if len(words) > 1:
+        # Each word must appear somewhere in the description (AND of wildcards)
+        desc_must = [{"wildcard": {"rule.description":
+                      {"value": f"*{w}*", "case_insensitive": True}}} for w in words]
+        log_must  = [{"wildcard": {"full_log":
+                      {"value": f"*{w}*", "case_insensitive": True}}} for w in words]
+        should = [
+            {"bool": {"must": desc_must}},   # all words in description
+            {"bool": {"must": log_must}},    # all words in full_log
+            {"match": {"rule.groups": q_lower}},
+        ]
+    else:
+        # Single word — simple wildcard
+        should = [
+            {"wildcard": {"rule.description": {"value": f"*{q_lower}*",
+                                               "case_insensitive": True}}},
+            {"wildcard": {"full_log":         {"value": f"*{q_lower}*",
+                                               "case_insensitive": True}}},
+            {"match":    {"rule.groups": q_lower}},
+        ]
+
+    # Add known-TTP specific group/field clauses if mapped
+    for key, clauses in TTP_MAP.items():
+        if key in q_lower or q_lower in key:
+            should.extend(clauses)
+            ttp_name = key
+            break
+
+    q = {"bool": {"must": must, "should": should, "minimum_should_match": 1}}
+
+    log.info("HUNT TTP query=%r days=%d agent=%s", query, days, agent_id)
+
+    aggs = {
+        "by_agent": {"terms": {"field": "agent.id", "size": 20},
+                     "aggs":  {"name": {"terms": {"field": "agent.name", "size": 1}}}},
+        "by_rule":  {"terms": {"field": "rule.description", "size": 10}},
+        "total":    {"value_count": {"field": "rule.level"}},
+        "severity": {"max":         {"field": "rule.level"}},
+    }
+    agg_result = ix_agg(q, aggs)
+
+    hits  = ix_search(q, size=10, sort=[{"timestamp": {"order": "desc"}}])
+    total = agg_result.get("total", {}).get("value", 0)
+    log.info("HUNT TTP result: total=%d", total)
+
+    return {
+        "hunt_type": "TTP",
+        "ttp_name":  ttp_name,
+        "value":     query,
+        "days":      days,
+        "total":     total,
+        "max_sev":   agg_result.get("severity", {}).get("value", 0),
+        "by_agent":  agg_result.get("by_agent", {}).get("buckets", []),
+        "by_rule":   agg_result.get("by_rule",  {}).get("buckets", []),
+        "by_tactic": [],
+        "samples":   hits.get("hits", []),
+    }
+
+
+
+
+# ── Alert Triage ──────────────────────────────────────────────────────────────
+# Scores and buckets all alerts by URGENCY using signals derived from the
+# data itself — NOT a hardcoded scenario catalog. Adapts to any environment.
+#
+# Score = severity + behavior-confidence + chain-density + mitre-presence
+#         - noise-penalty (how common this rule is in the baseline window)
+#
+# Weights are configurable via .env so analysts can tune per environment.
+
+TRIAGE_WEIGHTS = {
+    "severity":  float(os.getenv("TRIAGE_W_SEVERITY",  "1.0")),
+    "behavior":  float(os.getenv("TRIAGE_W_BEHAVIOR",  "4.0")),
+    "chain":     float(os.getenv("TRIAGE_W_CHAIN",     "0.5")),
+    "mitre":     float(os.getenv("TRIAGE_W_MITRE",     "2.0")),
+    "noise":     float(os.getenv("TRIAGE_W_NOISE",     "3.0")),
+}
+
+def _rule_baseline_freq(rule_groups, baseline_days=30):
+    """How often does this rule group fire over the baseline window?
+    Used for rarity scoring — common rules get a noise penalty.
+    Returns events-per-day rate."""
+    since = (datetime.now(timezone.utc) - timedelta(days=baseline_days)).isoformat()
+    q = {"bool":{"must":[{"range":{"timestamp":{"gte":since}}},
+                         {"match":{"rule.groups":rule_groups}}]}}
+    try:
+        agg = ix_agg(q, {"c":{"value_count":{"field":"rule.level"}}})
+        total = agg.get("c",{}).get("value",0)
+        return total / max(baseline_days,1)
+    except Exception:
+        return 0.0
+
+
+# High-risk tactics that warrant immediate attention when present
+_HIGH_RISK_TACTICS = {"Privilege Escalation", "Credential Access",
+                      "Lateral Movement", "Exfiltration", "Command and Control",
+                      "Defense Evasion", "Impact"}
+
+def _triage_insight(grp, count, max_lv, tactics, daily_rate, top_rules):
+    """
+    Derive a human-readable WHY and WHAT-TO-LOOK-AT from data signals only.
+    No hardcoded scenario catalog — text is composed from the signal pattern.
+    Returns (reason, action, focus).
+    """
+    high_risk = [t for t in tactics if t in _HIGH_RISK_TACTICS]
+    is_common = daily_rate > 50
+    is_rare   = daily_rate < 1 and count >= 3   # rare but clustered
+
+    # ── WHY does this need a look (reason) ───────────────────────────────────
+    parts = []
+    if max_lv >= 12:
+        parts.append(f"high-severity (level {max_lv})")
+    elif max_lv >= 7:
+        parts.append(f"medium-severity (level {max_lv})")
+    else:
+        parts.append(f"low-severity (level {max_lv})")
+
+    if high_risk:
+        parts.append(f"tagged with {', '.join(high_risk)}")
+    if count >= 15:
+        parts.append(f"high volume ({count} events — a sustained burst, not a one-off)")
+    elif count >= 5:
+        parts.append(f"{count} related events")
+
+    if is_rare:
+        parts.append("rarely seen in your environment (anomalous)")
+    elif is_common:
+        parts.append(f"very common (~{int(daily_rate)}/day — usually routine)")
+
+    reason = "; ".join(parts).capitalize() + "."
+
+    # ── WHAT to look at (focus) — derived from tactic + rule signals ─────────
+    focus = []
+    rule_txt = " ".join(top_rules).lower()
+
+    if "Privilege Escalation" in tactics or "Persistence" in tactics:
+        if "service" in rule_txt:
+            focus.append("the new service's ImagePath and whether it was authorized")
+        if "scheduled task" in rule_txt or "taskschd" in rule_txt:
+            focus.append("the scheduled task definition and what it executes")
+        if "registry" in rule_txt:
+            focus.append("the registry key modified and its value")
+    if "Credential Access" in tactics:
+        focus.append("which account was targeted and the source process")
+    if "Lateral Movement" in tactics:
+        focus.append("the source and destination hosts, and the account used")
+    if "Command and Control" in tactics or "Execution" in tactics:
+        if "script" in rule_txt or "powershell" in rule_txt:
+            focus.append("the script content and where it was dropped")
+        if "cmd" in rule_txt or "command" in rule_txt:
+            focus.append("the exact command line executed")
+    if "Defense Evasion" in tactics:
+        if "disconnect" in rule_txt:
+            focus.append("why the agent disconnected — possible tampering")
+        if "delete" in rule_txt or "cleared" in rule_txt:
+            focus.append("what was deleted and by which process")
+    if not focus:
+        focus.append("the event timeline and the process that triggered it")
+
+    # ── WHAT to do (action) ──────────────────────────────────────────────────
+    if max_lv >= 12 and high_risk:
+        action = "Investigate this agent now — run a full investigation."
+    elif high_risk and count >= 10:
+        action = "Run an investigation on this agent to see the full attack chain."
+    elif is_common and max_lv < 7:
+        action = "Likely routine. Dismiss unless it correlates with a higher-priority situation."
+    elif is_rare:
+        action = "Unusual pattern — worth a closer look even at low severity."
+    else:
+        action = "Review the sample events; investigate if the context looks unexpected."
+
+    return reason, action, focus
+
+def triage(hours=24, agent_id=None, min_sev=3):
+    """
+    Triage all alerts in the window. Returns prioritized situation buckets.
+    No hardcoded scenarios — scoring is derived from live data signals.
+    """
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+
+    # 1. Pull aggregated alert groups (reuses the same aggregation as fetch_alerts)
+    must = [{"range":{"timestamp":{"gte":since}}},
+            {"range":{"rule.level":{"gte":min_sev}}}]
+    if agent_id:
+        must.append({"term":{"agent.id":agent_id}})
+    q = {"bool":{"must":must}}
+
+    agg = ix_agg(q, {
+        "total":    {"value_count":{"field":"rule.level"}},
+        "by_group": {"terms":{"field":"rule.groups","size":50,
+                              "order":{"max_lv":"desc"}},
+                     "aggs":{"max_lv":   {"max":{"field":"rule.level"}},
+                             "count":    {"value_count":{"field":"rule.level"}},
+                             "agents":   {"terms":{"field":"agent.name","size":5}},
+                             "tactics":  {"terms":{"field":"rule.mitre.tactic","size":5}},
+                             "top_rules":{"terms":{"field":"rule.description","size":3}},
+                             "sample":   {"top_hits":{"size":1,
+                                          "sort":[{"rule.level":{"order":"desc"}}],
+                                          "_source":["timestamp","agent.name",
+                                          "rule.description","rule.level"]}}}},
+    })
+
+    total_alerts = agg.get("total",{}).get("value",0)
+    groups       = agg.get("by_group",{}).get("buckets",[])
+
+    if total_alerts == 0:
+        return {"mode":"triage","hours":hours,"total":0,"situations":[],
+                "urgent":[], "review":[], "routine":[]}
+
+    W = TRIAGE_WEIGHTS
+    situations = []
+
+    for g in groups:
+        grp_name = g["key"]
+        count    = g["count"]["value"]
+        max_lv   = g["max_lv"]["value"] or 0
+        agents   = [b["key"] for b in g.get("agents",{}).get("buckets",[])]
+        tactics  = [b["key"] for b in g.get("tactics",{}).get("buckets",[])]
+        rules    = [b["key"] for b in g.get("top_rules",{}).get("buckets",[])]
+        sample_h = g.get("sample",{}).get("hits",{}).get("hits",[])
+        sample   = sample_h[0]["_source"] if sample_h else {}
+
+        # ── Score from data-derived signals ──────────────────────────────────
+        # Severity: normalized 0-1 (Wazuh levels go to ~15)
+        sev_score = (max_lv / 15.0) * W["severity"]
+
+        # MITRE presence: does the data label this with a tactic?
+        mitre_score = (W["mitre"] if tactics else 0.0)
+
+        # Chain density: more events in the group = denser situation (log scale)
+        import math as _m
+        chain_score = _m.log10(count + 1) * W["chain"]
+
+        # Rarity / noise: how common is this rule group in the baseline?
+        # Common rules (high daily rate) get penalized.
+        daily_rate  = _rule_baseline_freq(grp_name)
+        # Normalize: >100/day = very noisy, demote heavily
+        noise_penalty = min(daily_rate / 100.0, 1.0) * W["noise"]
+
+        # Behavior confidence would require pulling the chain per group —
+        # expensive. We approximate using severity + tactic presence here,
+        # and the analyst can Investigate any group for full behavior detection.
+
+        score = sev_score + mitre_score + chain_score - noise_penalty
+
+        reason, action, focus = _triage_insight(
+            grp_name, count, max_lv, tactics, daily_rate, rules)
+
+        situations.append({
+            "group":       grp_name,
+            "count":       count,
+            "max_level":   max_lv,
+            "agents":      agents,
+            "tactics":     tactics,
+            "top_rules":   rules,
+            "sample":      sample,
+            "daily_rate":  round(daily_rate, 1),
+            "score":       round(score, 2),
+            "reason":      reason,
+            "action":      action,
+            "focus":       focus,
+        })
+
+    # Sort by score, highest first
+    situations.sort(key=lambda s: s["score"], reverse=True)
+
+    # ── Bucket by score thresholds (relative + absolute) ─────────────────────
+    # Absolute floors based on severity ensure a true crit is always urgent
+    urgent, review, routine = [], [], []
+    for s in situations:
+        if s["max_level"] >= 12 and s["score"] > 0:
+            urgent.append(s)
+        elif s["score"] >= 1.0:
+            review.append(s)
+        else:
+            routine.append(s)
+
+    return {
+        "mode":        "triage",
+        "hours":       hours,
+        "total":       total_alerts,
+        "situations":  len(situations),
+        "urgent":      urgent,
+        "review":      review,
+        "routine":     routine,
+    }
+
+
+
+def triage_insights_llm(situations):
+    """
+    Generator: takes Python-scored situations and streams an LLM analysis.
+    ONE model call. The LLM writes a verdict + recommendation per situation.
+    Yields text chunks (the raw model output) for SSE streaming.
+    Python keeps the scoring/bucketing — the LLM only adds judgment.
+    """
+    if not situations:
+        yield "No situations to analyse."
+        return
+
+    # Build a compact summary of each situation — NOT raw events.
+    lines = []
+    for i, s in enumerate(situations, 1):
+        agents  = ", ".join(s.get("agents", [])[:3]) or "unknown"
+        tactics = ", ".join(s.get("tactics", [])) or "none"
+        rules   = "; ".join(s.get("top_rules", [])[:2])
+        rate    = s.get("daily_rate", 0)
+        lines.append(
+            f"{i}. GROUP: {s['group']}\n"
+            f"   Severity: {s['max_level']} | Events: {s['count']} | "
+            f"Agents: {agents}\n"
+            f"   MITRE tactics: {tactics}\n"
+            f"   Rules: {rules}\n"
+            f"   Baseline rate: {rate}/day "
+            f"({'common/likely-noise' if rate > 50 else 'rare/notable' if rate < 1 else 'occasional'})"
+        )
+    situations_block = "\n\n".join(lines)
+
+    system = (
+        "You are a senior SOC analyst doing alert triage. You are given "
+        "pre-grouped, pre-scored alert situations. For EACH situation, give a "
+        "one-line verdict and a concrete recommendation. Be specific and brief. "
+        "Plain text only, no markdown. Do NOT re-score or re-order — the priority "
+        "is already decided. Focus on WHAT this likely is and WHAT the analyst "
+        "should do. Use the exact format below for every situation."
+    )
+    user = (
+        f"Here are {len(situations)} alert situations to triage:\n\n"
+        f"{situations_block}\n\n"
+        f"For each numbered situation, respond in exactly this format:\n"
+        f"[n] VERDICT: <one line: likely benign / suspicious / needs investigation / "
+        f"likely attack>\n"
+        f"    WHY: <one line — what the evidence suggests>\n"
+        f"    DO: <one line — the specific next action>\n"
+    )
+
+    client = ollama.Client(host=C["OL_HOST"])
+    try:
+        for chunk in client.chat(
+            model=C["MODEL"],
+            messages=[{"role": "system", "content": system},
+                      {"role": "user",   "content": user}],
+            stream=True,
+            options={"temperature": 0, "num_ctx": 8192, "num_predict": 1500},
+        ):
+            if STOP_FLAG.is_set():
+                break
+            txt = chunk.message.content
+            if txt:
+                yield txt
+    except Exception as e:
+        yield f"\n[LLM analysis unavailable: {e}]"
+
+
+# ── Threat Category Hunt ──────────────────────────────────────────────────────
+# Maps high-level analyst questions to bundles of detection patterns.
+# Each category searches rule.description (keyword field → wildcards) and
+# rule.groups for indicators of that whole class of attack.
+
+THREAT_CATEGORIES = {
+    "exfiltration": {
+        "label": "Data Exfiltration",
+        "desc_terms": ["exfiltrat", "data transfer", "large outbound",
+                       "dns tunnel", "upload", "compress", "archive created",
+                       "rar", "7z", "zip", "ftp", "scp", "data staged"],
+        "groups": ["sysmon_eid3_detections"],
+        "tactics": ["Exfiltration", "Collection", "Command and Control"],
+    },
+    "rce": {
+        "label": "Remote Code Execution",
+        "desc_terms": ["remote command", "remote code", "remote execution",
+                       "wmiprvse", "psexec", "services.exe", "powershell remot",
+                       "winrm", "impacket", "suspicious cmd", "command execution"],
+        "groups": ["impacket", "sysmon"],
+        "tactics": ["Execution", "Lateral Movement"],
+    },
+    "privesc": {
+        "label": "Privilege Escalation",
+        "desc_terms": ["privilege escalation", "uac bypass", "token",
+                       "elevated", "administrators group", "admin rights",
+                       "se_debug", "getsystem", "potato", "exploit"],
+        "groups": ["sysmon"],
+        "tactics": ["Privilege Escalation"],
+    },
+    "persistence": {
+        "label": "Persistence Mechanisms",
+        "desc_terms": ["persistence", "scheduled task", "new service",
+                       "registry run", "startup", "autorun", "wmi subscription",
+                       "logon script", "service created"],
+        "groups": [],
+        "tactics": ["Persistence"],
+    },
+    "credential_access": {
+        "label": "Credential Access",
+        "desc_terms": ["credential", "lsass", "mimikatz", "pass-the-hash",
+                       "ntlm", "kerberoast", "dcsync", "sam dump",
+                       "password", "hash dump"],
+        "groups": [],
+        "tactics": ["Credential Access"],
+    },
+    "lateral": {
+        "label": "Lateral Movement",
+        "desc_terms": ["lateral", "remote logon", "smb", "psexec", "wmi",
+                       "rdp", "pass-the-hash", "remote service", "admin share"],
+        "groups": ["impacket"],
+        "tactics": ["Lateral Movement"],
+    },
+    "defense_evasion": {
+        "label": "Defense Evasion",
+        "desc_terms": ["defense evasion", "cleared", "log deleted",
+                       "disabled", "bypass", "obfuscat", "encoded",
+                       "process injection", "masquerad", "timestomp"],
+        "groups": [],
+        "tactics": ["Defense Evasion"],
+    },
+    "critical": {
+        "label": "Critical Alerts Requiring Attention",
+        "desc_terms": [],   # severity-driven, not keyword
+        "groups": [],
+        "tactics": [],
+        "min_level": 12,    # only high/critical
+    },
+}
+
+def threat_hunt(category, hours=24, agent_id=None):
+    """
+    Hunt for a whole CATEGORY of threat (exfiltration, rce, privesc, etc).
+    Returns a structured briefing: matches, affected agents, top rules,
+    tactic spread, and sample events.
+    """
+    cat = THREAT_CATEGORIES.get(category)
+    if not cat:
+        return {"error": f"Unknown threat category: {category}"}
+
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    must  = [{"range": {"timestamp": {"gte": since}}}]
+    if agent_id:
+        must.append({"term": {"agent.id": agent_id}})
+
+    # Minimum severity floor for the category (critical = 12+)
+    min_level = cat.get("min_level", 0)
+    if min_level:
+        must.append({"range": {"rule.level": {"gte": min_level}}})
+
+    # Build should-clauses from description terms (wildcard) + groups (match)
+    should = []
+    for term in cat["desc_terms"]:
+        should.append({"wildcard": {"rule.description":
+                       {"value": f"*{term.lower()}*", "case_insensitive": True}}})
+    for grp in cat["groups"]:
+        should.append({"match": {"rule.groups": grp}})
+    # Tactic match (if the field exists in the mapping)
+    for tactic in cat["tactics"]:
+        should.append({"match_phrase": {"rule.mitre.tactic": tactic}})
+
+    if should:
+        q = {"bool": {"must": must, "should": should, "minimum_should_match": 1}}
+    else:
+        # Critical-only: no should clauses, just the severity floor
+        q = {"bool": {"must": must}}
+
+    log.info("THREAT HUNT category=%s hours=%d agent=%s", category, hours, agent_id)
+
+    aggs = {
+        "by_agent": {"terms": {"field": "agent.id", "size": 20},
+                     "aggs":  {"name": {"terms": {"field": "agent.name", "size": 1}}}},
+        "by_rule":  {"terms": {"field": "rule.description", "size": 12}},
+        "by_level": {"terms": {"field": "rule.level", "size": 15}},
+        "total":    {"value_count": {"field": "rule.level"}},
+        "max_sev":  {"max":         {"field": "rule.level"}},
+    }
+    agg = ix_agg(q, aggs)
+    hits = ix_search(q, size=15, sort=[{"rule.level": {"order": "desc"}},
+                                       {"timestamp":  {"order": "desc"}}])
+    total = agg.get("total", {}).get("value", 0)
+    log.info("THREAT HUNT result: category=%s total=%d", category, total)
+
+    return {
+        "mode":       "threat_category",
+        "category":   category,
+        "label":      cat["label"],
+        "hours":      hours,
+        "total":      total,
+        "max_sev":    agg.get("max_sev", {}).get("value", 0),
+        "by_agent":   agg.get("by_agent", {}).get("buckets", []),
+        "by_rule":    agg.get("by_rule",  {}).get("buckets", []),
+        "by_level":   agg.get("by_level", {}).get("buckets", []),
+        "tactics":    cat["tactics"],
+        "samples":    hits.get("hits", []),
+    }
+
+
+def hunt(query, days=7, agent_id=None, hunt_type="auto"):
+    """
+    Main hunt entry point.
+    hunt_type: "auto" (detect), "ioc" (force IOC), "ttp" (force TTP)
+    Returns structured result dict.
+    """
+    query = query.strip()
+    if not query:
+        return {"error": "Empty query"}
+
+    # Auto-detect type
+    if hunt_type == "auto":
+        if (_IP_RE.match(query) or _HASH_RE.match(query) or
+                _CVE_RE.match(query) or "." in query and len(query) < 50):
+            hunt_type = "ioc"
+        else:
+            hunt_type = "ttp"
+
+    if hunt_type == "ioc":
+        return _hunt_ioc(query, days, agent_id)
+    else:
+        return _hunt_ttp(query, days, agent_id)
 
 # -- Main ---------------------------------------------------------------------
 _enrolled = {}
