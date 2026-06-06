@@ -33,7 +33,7 @@ HOURS   = int(os.getenv("LOOK_BACK_HOURS","24"))
 
 # -- Logger --------------------------------------------------------------------
 def _setup_logger(debug=False):
-    log = logging.getLogger("correlate")
+    log = logging.getLogger("client")
     log.setLevel(logging.DEBUG if debug else logging.WARNING)
     log.handlers.clear()
     fmt = logging.Formatter("%(asctime)s.%(msecs)03d  %(message)s", datefmt="%H:%M:%S")
@@ -42,7 +42,7 @@ def _setup_logger(debug=False):
     sh.setFormatter(fmt)
     log.addHandler(sh)
     if debug:
-        fh = logging.FileHandler("correlate.log", mode="a")
+        fh = logging.FileHandler("client.log", mode="a")
         fh.setLevel(logging.DEBUG); fh.setFormatter(fmt)
         log.addHandler(fh)
     return log
