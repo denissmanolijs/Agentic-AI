@@ -1,4 +1,3 @@
-
 import os, sys, json, queue, threading, time, logging, argparse
 from datetime import datetime
 from pathlib import Path
@@ -8,7 +7,7 @@ from flask_cors import CORS
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import correlate as ag        # owns .env loading + config dict C
+import client as ag        # owns .env loading + config dict C
 import agent_tools as agent   # the agentic tool-calling loop
 
 app  = Flask(__name__)
@@ -17,7 +16,6 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s  %(levelname)s  %(message)s")
 log = logging.getLogger("app")
 
-# Single config source — all of these come from correlate.C (.env read once there)
 AGENTIC_MODEL = ag.C["AGENTIC_MODEL"]
 UI_PORT       = ag.C["UI_PORT"]
 UI_HOST       = ag.C["UI_HOST"]
@@ -365,8 +363,24 @@ input:checked+.slider:before{transform:translateX(14px)}
 .report-header{padding:10px 18px;border-bottom:1px solid #30363d;
   font-size:12px;font-weight:600;color:#8b949e;flex-shrink:0;
   display:flex;align-items:center;gap:10px}
-#report-out{flex:1;padding:16px 20px;overflow-y:auto;font-size:13px;
-  line-height:1.75;word-break:break-word;white-space:pre-wrap}
+#report-out{flex:1;padding:16px 22px;overflow-y:auto;font-size:13px;
+  line-height:1.7;word-break:break-word}
+#report-out .md-h{font-weight:700;color:#e6edf3;margin:14px 0 6px}
+#report-out .md-h1{font-size:17px}
+#report-out .md-h2{font-size:15px;color:#58a6ff}
+#report-out .md-h3{font-size:14px;color:#79c0ff}
+#report-out .md-h4{font-size:13px;color:#8b949e;text-transform:uppercase;letter-spacing:.04em}
+#report-out .md-p{margin:4px 0;color:#c9d1d9}
+#report-out .md-ul,#report-out .md-ol{margin:4px 0 8px 4px;padding-left:22px;color:#c9d1d9}
+#report-out .md-ul li,#report-out .md-ol li{margin:3px 0}
+#report-out .md-sp{height:8px}
+#report-out .md-hr{border:none;border-top:1px solid #30363d;margin:14px 0}
+#report-out code{background:#161b22;border:1px solid #30363d;border-radius:4px;
+  padding:1px 5px;font-size:12px;color:#79c0ff}
+#report-out strong{color:#e6edf3;font-weight:700}
+#report-out em{color:#d2a8ff;font-style:italic}
+#report-out .md-pre{background:#161b22;border:1px solid #30363d;border-radius:6px;
+  padding:10px 12px;overflow-x:auto;font-size:12px;color:#c9d1d9;margin:8px 0;white-space:pre}
 </style>
 </head>
 <body>
@@ -612,7 +626,7 @@ function showReport(id) {
       if (cb) cb.style.display = 'none';
     } else {
       hdr.textContent = d.label || d.id;
-      out.textContent = d.report || '[No report available]';
+      out.innerHTML = renderMD(d.report || '[No report available]');
       out.scrollTop = 0;
       if (cb) cb.style.display = d.report ? 'inline-block' : 'none';
     }
@@ -621,6 +635,48 @@ function showReport(id) {
 }
 
 function esc(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
+// Minimal, dependency-free markdown renderer for the report view.
+function renderMD(src) {
+  const lines = (src || '').split('\n');
+  let html = '', inUL = false, inOL = false, inCode = false, codeBuf = [];
+  const closeLists = () => {
+    if (inUL) { html += '</ul>'; inUL = false; }
+    if (inOL) { html += '</ol>'; inOL = false; }
+  };
+  const inline = (t) => esc(t)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[^*])\*([^*]+)\*/g, '$1<em>$2</em>');
+  for (let raw of lines) {
+    const line = raw.replace(/\s+$/,'');
+    if (line.trim().startsWith('```')) {
+      if (inCode) { html += '<pre class="md-pre">' + esc(codeBuf.join('\n')) + '</pre>'; codeBuf=[]; inCode=false; }
+      else { closeLists(); inCode = true; }
+      continue;
+    }
+    if (inCode) { codeBuf.push(raw); continue; }
+    if (/^\s*[-─=]{3,}\s*$/.test(line)) { closeLists(); html += '<hr class="md-hr">'; continue; }
+    let m;
+    if ((m = line.match(/^(#{1,4})\s+(.*)/))) {
+      closeLists(); const lvl = m[1].length;
+      html += '<div class="md-h md-h'+lvl+'">' + inline(m[2]) + '</div>'; continue;
+    }
+    if ((m = line.match(/^\s*[-*]\s+(.*)/))) {
+      if (!inUL) { closeLists(); html += '<ul class="md-ul">'; inUL = true; }
+      html += '<li>' + inline(m[1]) + '</li>'; continue;
+    }
+    if ((m = line.match(/^\s*\d+[.)]\s+(.*)/))) {
+      if (!inOL) { closeLists(); html += '<ol class="md-ol">'; inOL = true; }
+      html += '<li>' + inline(m[1]) + '</li>'; continue;
+    }
+    if (line.trim() === '') { closeLists(); html += '<div class="md-sp"></div>'; continue; }
+    closeLists(); html += '<div class="md-p">' + inline(line) + '</div>';
+  }
+  if (inCode) html += '<pre class="md-pre">' + esc(codeBuf.join('\n')) + '</pre>';
+  closeLists();
+  return html;
+}
 
 function copyReport() {
   const t = document.getElementById('report-out').innerText;
@@ -705,6 +761,11 @@ def _serve(args):
     app.run(host=args.host, port=args.port, debug=False, threaded=True)
 
 def main():
+    # Accept both styles: "app.py stop" and "app.py --stop".
+    _aliases = {"--start":"start","--stop":"stop","--restart":"restart",
+                "--status":"status","--run":"run"}
+    sys.argv[1:] = [_aliases.get(a, a) for a in sys.argv[1:]]
+
     p = argparse.ArgumentParser(description="Wazuh Agentic Security Analyst")
     p.add_argument("command", nargs="?", default="run",
                    choices=["run", "start", "stop", "restart", "status"],

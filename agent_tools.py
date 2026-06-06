@@ -1,9 +1,3 @@
-"""
-Run standalone for testing:
-    python3 agent_tools.py "is there data exfiltration on my endpoints?"
-    python3 agent_tools.py --agent 001 "what is this host doing that's unusual?"
-"""
-
 import os
 import sys
 import json
@@ -13,25 +7,13 @@ from datetime import datetime, timezone, timedelta
 
 import ollama
 
-# Reuse the proven, deterministic data-access functions from correlate.py.
-# We call THESE as the tool implementations — no duplicated query logic.
-import correlate as ag
+import client as ag
 
 log = logging.getLogger("agent")
 
-# ── Config ────────────────────────────────────────────────────────────────────
-# All config lives in correlate.C (single source — .env is read once, there).
 AGENTIC_MODEL = ag.C["AGENTIC_MODEL"]
 OL_HOST       = ag.C["OL_HOST"]
 MAX_STEPS     = ag.C["AGENTIC_MAX_STEPS"]   # safety cap on the loop
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  AGENT ID RESOLUTION
-#  The model often passes an agent NAME ("windows11") where the indexer expects
-#  an ID ("002"). This resolver accepts either and returns the real ID, so a
-#  name/ID mix-up never silently yields zero results.
-# ──────────────────────────────────────────────────────────────────────────────
 
 _agent_cache = {}   # name/id (lower) -> id
 
@@ -42,7 +24,6 @@ def _resolve_agent(agent_id):
         return None
     key = str(agent_id).strip().lower()
 
-    # Looks like a numeric ID already (e.g. "1", "001", "002")
     if key.isdigit():
         return key.zfill(3)
 
@@ -68,8 +49,6 @@ def _resolve_agent(agent_id):
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  TOOL IMPLEMENTATIONS
-#  Each returns a compact, JSON-serializable result. They wrap the existing
-#  correlate.py functions so the data pipeline stays identical and auditable.
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _tool_search_alerts(query: str = "", hours: int = 24, agent_id: str = None,
@@ -172,15 +151,13 @@ def _tool_get_inventory(kind: str, agent_id: str):
     """Host inventory: packages | ports | processes | files (via syscollector).
     Returns the RAW inventory rows with no 'suspicious' flagging — the model
     inspects the actual names/ports/paths and decides what is concerning.
-    Python imposes no suspect list here."""
+     """
     if kind not in ("packages", "ports", "processes", "files"):
         return {"error": f"kind must be packages/ports/processes/files, got {kind}"}
-    res = ag.inventory(kind, _resolve_agent(agent_id), only_suspicious=False)
-    # Strip Python's _sus flags so no hidden judgment reaches the model
+    res = ag.inventory(kind, _resolve_agent(agent_id))
+    # inventory() already returns raw facts only — no judgment to strip.
+    # Cap rows so a large host doesn't flood the model's context.
     rows = res.get("rows", [])
-    for r in rows:
-        r.pop("_sus", None)
-    res.pop("flags", None)
     if len(rows) > 50:
         res["rows"] = rows[:50]
         res["truncated"] = True
@@ -189,9 +166,7 @@ def _tool_get_inventory(kind: str, agent_id: str):
 
 
 def _tool_get_rule_frequency(rule_groups: str, days: int = 30):
-    """Baseline frequency: events/day for a rule group over the window, plus
-    the window total. Returns raw numbers ONLY — the model decides whether the
-    rate is noise or notable. No Python verdict is imposed."""
+
     rate  = ag._rule_baseline_freq(rule_groups, baseline_days=days)
     return {"rule_groups": rule_groups, "baseline_days": days,
             "events_per_day": round(rate, 2),
@@ -200,13 +175,7 @@ def _tool_get_rule_frequency(rule_groups: str, days: int = 30):
 
 def _tool_get_event_sequence(agent_id: str, around_time: str = None,
                             window_minutes: int = 30, min_level: int = 0):
-    """
-    Reconstruct the DISTINCT, time-ordered event sequence on one host within a
-    window — the raw material for chain analysis. Unlike get_agent_timeline
-    (a flat sample), this returns deduplicated steps with process lineage
-    (image, parent, command), file/registry targets, user, and source IP, so
-    you can see what led to what. Returns facts only — YOU reconstruct the chain.
-    """
+
     aid = _resolve_agent(agent_id)
     # Resolve the window. If a time is given, center on it; else last N minutes.
     try:
@@ -309,11 +278,7 @@ def _tool_find_entity_across_agents(entity: str, hours: int = 168):
 
 
 def _tool_get_vulnerabilities(agent_id: str = None, days: int = 30):
-    """
-    Find detected vulnerabilities (CVEs) from Wazuh's vulnerability-detector,
-    read from the indexer (no Wazuh API token needed). Optionally scope to one
-    agent. Returns CVE descriptions and the affected hosts. Facts only —
-    YOU assess which CVEs matter given the host's exposure."""
+
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     must = [{"range": {"timestamp": {"gte": since}}},
             {"match": {"rule.groups": "vulnerability-detector"}}]
