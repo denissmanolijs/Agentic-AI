@@ -1,9 +1,14 @@
 import os, sys, json, queue, threading, time, logging, argparse
+import html as _html
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from datetime import datetime
 from pathlib import Path
 from collections import OrderedDict
 from flask import Flask, Response, request, render_template_string, jsonify
 from flask_cors import CORS
+import ollama
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -105,12 +110,18 @@ def _run_agentic(question, run_id, q=None):
               f"{'─'*50}\nTOOL-CALL AUDIT TRAIL ({len(audit)} calls)\n{'─'*50}\n"
               f"{audit_text}")
 
+    # Generate structured JSON report (second LLM pass; skipped if run was stopped)
+    structured = None
+    if not ag.STOP_FLAG.is_set():
+        structured = _generate_structured(question, final, audit)
+
     with ST.hist_lock:
         if run_id in ST.history:
             ST.history[run_id]["status"] = ("stopped" if ag.STOP_FLAG.is_set()
                                             else "completed")
-            ST.history[run_id]["report"] = report
-            ST.history[run_id]["ended"]  = datetime.now().strftime("%H:%M")
+            ST.history[run_id]["report"]     = report
+            ST.history[run_id]["structured"] = structured
+            ST.history[run_id]["ended"]      = datetime.now().strftime("%H:%M")
         while len(ST.history) > 50:
             ST.history.popitem(last=False)
         ST._save_history()
@@ -118,6 +129,163 @@ def _run_agentic(question, run_id, q=None):
     if q is not None:
         q.put("__DONE__")
     return report
+
+
+# ── Structured report generation ──────────────────────────────────────────────
+_STRUCT_PROMPT = """\
+You are a security report formatter. Given the investigation question and analyst findings, \
+produce a structured JSON report. Return ONLY valid JSON — no markdown, no explanation.
+
+QUESTION: {question}
+
+FINDINGS:
+{final}
+
+JSON schema (use exactly these keys):
+{{
+  "executive_summary": "2-3 sentence plain-text summary",
+  "severity": "critical|high|medium|low|info",
+  "affected_hosts": ["hostname"],
+  "key_findings": [
+    {{"title": "short title", "severity": "critical|high|medium|low|info", "detail": "detail"}}
+  ],
+  "recommendations": ["action item"],
+  "iocs": ["ip/hash/username/domain — omit if none"]
+}}"""
+
+def _generate_structured(question, final, audit):
+    """Call the LLM a second time to turn the free-text answer into structured JSON.
+    Returns a dict on success, None on any failure (graceful degradation)."""
+    if not final or final.startswith("[error"):
+        return None
+    try:
+        cl = ollama.Client(host=ag.C["OL_HOST"])
+        resp = cl.chat(
+            model=ag.C["AGENTIC_MODEL"],
+            messages=[{"role": "user",
+                       "content": _STRUCT_PROMPT.format(question=question, final=final)}],
+            options={"temperature": 0.1},
+        )
+        text = (resp.get("message") or {}).get("content", "").strip()
+        # Strip markdown code fences if the model wraps the JSON
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+            text = text.strip()
+        return json.loads(text)
+    except Exception as e:
+        log.warning("Structured report generation failed: %s", e)
+        return None
+
+
+# ── HTML email builder ─────────────────────────────────────────────────────────
+def _he(s):
+    """HTML-escape a value for use inside email body."""
+    return _html.escape(str(s or ""))
+
+def _report_to_html(item, s):
+    """Build a self-contained HTML email from a structured report dict."""
+    sev_colors = {"critical": "#c0392b", "high": "#e67e22", "medium": "#d4a017",
+                  "low": "#27ae60", "info": "#2980b9"}
+    sev  = (s.get("severity") or "info").lower()
+    sc   = sev_colors.get(sev, "#2980b9")
+    label    = _he(item.get("label", "Investigation"))
+    started  = item.get("started", "")
+    ended    = item.get("ended", "")
+    duration = started + (f" — {ended}" if ended else "")
+
+    def finding_card(f):
+        fs  = (f.get("severity") or "info").lower()
+        fc  = sev_colors.get(fs, "#2980b9")
+        return (f'<div style="border-left:4px solid {fc};background:#f8f9fa;'
+                f'padding:10px 14px;margin:6px 0;border-radius:0 4px 4px 0">'
+                f'<div style="font-size:11px;font-weight:700;color:{fc};'
+                f'text-transform:uppercase;margin-bottom:3px">'
+                f'{fs.upper()} — {_he(f.get("title",""))}</div>'
+                f'<div style="font-size:13px;color:#333;line-height:1.5">'
+                f'{_he(f.get("detail",""))}</div></div>')
+
+    findings_html = "".join(finding_card(f) for f in (s.get("key_findings") or []))
+    recs_html = "".join(
+        f'<li style="margin:4px 0;font-size:13px;color:#333">{_he(r)}</li>'
+        for r in (s.get("recommendations") or []))
+    iocs_html = "".join(
+        f'<li style="margin:4px 0"><code style="background:#eee;padding:1px 5px;'
+        f'border-radius:3px;font-size:12px">{_he(i)}</code></li>'
+        for i in (s.get("iocs") or []) if i)
+    hosts = ", ".join(_he(h) for h in (s.get("affected_hosts") or []))
+
+    section = lambda title, body: (
+        f'<div style="padding:14px 22px;border-bottom:1px solid #eee">'
+        f'<div style="font-size:10px;font-weight:700;text-transform:uppercase;'
+        f'letter-spacing:.07em;color:#888;margin-bottom:8px">{title}</div>'
+        f'{body}</div>')
+
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"></head>
+<body style="margin:0;padding:0;background:#f0f2f5;font-family:Arial,sans-serif">
+<div style="max-width:680px;margin:24px auto;background:#fff;border-radius:8px;
+            overflow:hidden;box-shadow:0 2px 10px rgba(0,0,0,.12)">
+  <div style="background:{sc};padding:18px 22px;color:#fff">
+    <div style="font-size:10px;text-transform:uppercase;letter-spacing:.1em;opacity:.8">
+      Security Investigation Report — {sev.upper()}</div>
+    <div style="font-size:19px;font-weight:700;margin:5px 0">{label}</div>
+    <div style="font-size:12px;opacity:.75">{duration}</div>
+  </div>
+  {section("Executive Summary",
+      f'<div style="font-size:14px;line-height:1.65;color:#222">{_he(s.get("executive_summary",""))}</div>'
+      + (f'<div style="margin-top:8px;font-size:12px;color:#666">Affected hosts: <strong>{hosts}</strong></div>' if hosts else ""))}
+  {section("Key Findings", findings_html) if findings_html else ""}
+  {section("Recommendations", f'<ol style="margin:0;padding-left:18px">{recs_html}</ol>') if recs_html else ""}
+  {section("Indicators of Compromise", f'<ul style="margin:0;padding-left:18px">{iocs_html}</ul>') if iocs_html else ""}
+  <div style="padding:12px 22px;font-size:11px;color:#aaa;text-align:center">
+    Generated by Agentic Security Analyst &bull; {datetime.now().strftime("%Y-%m-%d %H:%M")}
+  </div>
+</div></body></html>"""
+
+
+# ── Email delivery ─────────────────────────────────────────────────────────────
+def _send_email(item):
+    """Send a report email. Returns (ok: bool, error: str)."""
+    smtp_host = ag.C.get("SMTP_HOST", "")
+    smtp_to   = ag.C.get("SMTP_TO",   "")
+    if not smtp_host:
+        return False, "SMTP_HOST not configured in .env"
+    if not smtp_to:
+        return False, "SMTP_TO not configured in .env"
+
+    smtp_port = ag.C.get("SMTP_PORT", 587)
+    smtp_user = ag.C.get("SMTP_USER", "")
+    smtp_pass = ag.C.get("SMTP_PASS", "")
+    smtp_from = ag.C.get("SMTP_FROM", "") or smtp_user
+
+    subject = f"[Security Investigation] {item.get('label', item['id'])}"
+    structured = item.get("structured")
+    html_body  = _report_to_html(item, structured) if structured else (
+        f"<pre style='font-family:monospace;font-size:12px'>"
+        f"{_he(item.get('report',''))}</pre>")
+    text_body  = item.get("report", "")
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"]    = smtp_from
+    msg["To"]      = smtp_to
+    msg.attach(MIMEText(text_body, "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html",  "utf-8"))
+
+    recipients = [r.strip() for r in smtp_to.split(",") if r.strip()]
+    try:
+        with smtplib.SMTP(smtp_host, int(smtp_port), timeout=15) as s:
+            s.ehlo()
+            s.starttls()
+            if smtp_user:
+                s.login(smtp_user, smtp_pass)
+            s.sendmail(smtp_from, recipients, msg.as_string())
+        log.info("Report email sent to %s (run_id=%s)", smtp_to, item.get("id"))
+        return True, ""
+    except Exception as e:
+        log.warning("Email send failed: %s", e)
+        return False, str(e)
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -203,6 +371,18 @@ def delete_report(run_id):
         del ST.history[run_id]
         ST._save_history()
     return jsonify({"ok": True})
+
+
+@app.route("/email/<run_id>", methods=["POST"])
+def email_report(run_id):
+    with ST.hist_lock:
+        item = ST.history.get(run_id)
+    if not item:
+        return jsonify({"error": "not found"}), 404
+    if item.get("status") == "running":
+        return jsonify({"error": "investigation still running"}), 409
+    ok, err = _send_email(item)
+    return jsonify({"ok": ok, "error": err})
 
 
 @app.route("/schedule", methods=["POST"])
@@ -381,6 +561,40 @@ input:checked+.slider:before{transform:translateX(14px)}
 #report-out em{color:#d2a8ff;font-style:italic}
 #report-out .md-pre{background:#161b22;border:1px solid #30363d;border-radius:6px;
   padding:10px 12px;overflow-x:auto;font-size:12px;color:#c9d1d9;margin:8px 0;white-space:pre}
+
+/* Structured report */
+.sr-sev-banner{border-left:4px solid var(--sc,#58a6ff);background:#161b22;
+  border-radius:0 6px 6px 0;padding:12px 16px;margin-bottom:16px}
+.sr-sev-label{font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.07em}
+.sr-sev-value{font-size:20px;font-weight:700;text-transform:uppercase;color:var(--sc,#58a6ff)}
+.sr-section{margin-bottom:18px}
+.sr-title{font-size:10px;font-weight:700;color:#8b949e;text-transform:uppercase;
+  letter-spacing:.07em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid #21262d}
+.sr-body{font-size:13px;line-height:1.65;color:#c9d1d9}
+.sr-finding{border-left:3px solid var(--fc,#58a6ff);background:#161b22;
+  border-radius:0 5px 5px 0;padding:10px 14px;margin:6px 0}
+.sr-finding-title{font-size:13px;font-weight:600;color:#e6edf3;
+  margin-bottom:5px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.sr-finding-detail{font-size:12px;color:#8b949e;line-height:1.5}
+.sr-sev-badge{font-size:10px;padding:2px 7px;border-radius:3px;font-weight:700;
+  flex-shrink:0;border:1px solid transparent}
+.sr-chip{font-size:11px;background:#21262d;border:1px solid #30363d;
+  border-radius:4px;padding:2px 8px;color:#e6edf3;display:inline-block;margin:2px}
+.sr-ioc{background:#161b22;border:1px solid #30363d;border-radius:4px;
+  padding:2px 7px;font-size:12px;color:#79c0ff;display:inline-block;margin:2px;
+  font-family:monospace}
+.sr-list{margin:0;padding-left:18px;color:#c9d1d9;font-size:13px;line-height:1.8}
+.sr-list li{margin:2px 0}
+.view-toggle{display:flex}
+.view-btn{font-size:11px;padding:3px 10px;background:#21262d;color:#8b949e;
+  border:1px solid #30363d;cursor:pointer;transition:color .15s,background .15s}
+.view-btn:first-child{border-radius:4px 0 0 4px}
+.view-btn:last-child{border-radius:0 4px 4px 0;border-left:none}
+.view-btn.active{background:#1f6feb22;color:#58a6ff;border-color:#1f6feb55}
+.email-btn{font-size:11px;padding:3px 10px;background:#21262d;color:#8b949e;
+  border:1px solid #30363d;border-radius:4px;cursor:pointer;transition:color .15s}
+.email-btn:hover:not(:disabled){color:#e6edf3}
+.email-btn:disabled{opacity:.45;cursor:not-allowed}
 </style>
 </head>
 <body>
@@ -463,10 +677,20 @@ input:checked+.slider:before{transform:translateX(14px)}
     <div class="report-main">
       <div class="report-header">
         <span id="report-header-text">Select an investigation from the sidebar</span>
-        <button id="copy-btn" onclick="copyReport()"
-          style="margin-left:auto;font-size:11px;padding:3px 10px;background:#21262d;
-          color:#8b949e;border:1px solid #30363d;border-radius:4px;cursor:pointer;
-          display:none">Copy</button>
+        <div style="margin-left:auto;display:flex;align-items:center;gap:6px">
+          <div class="view-toggle" id="view-toggle" style="display:none">
+            <button class="view-btn active" id="view-btn-fmt"
+              onclick="setView('formatted')">Formatted</button>
+            <button class="view-btn" id="view-btn-raw"
+              onclick="setView('raw')">Raw</button>
+          </div>
+          <button id="email-btn" class="email-btn"
+            onclick="emailReport()" style="display:none">Email</button>
+          <button id="copy-btn" onclick="copyReport()"
+            style="font-size:11px;padding:3px 10px;background:#21262d;
+            color:#8b949e;border:1px solid #30363d;border-radius:4px;cursor:pointer;
+            display:none">Copy</button>
+        </div>
       </div>
       <div id="report-out"></div>
     </div>
@@ -475,7 +699,8 @@ input:checked+.slider:before{transform:translateX(14px)}
 
 <script>
 let _es=null, _running=false, _t0=0, _timer=null, _liveBuffer='',
-    _pendingQ=null, _histData=[], _activeId=null, _curRunId=null;
+    _pendingQ=null, _histData=[], _activeId=null, _curRunId=null,
+    _activeItem=null, _activeView='formatted';
 
 function switchTab(name) {
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -617,21 +842,141 @@ function _renderHistory() {
 function showReport(id) {
   _activeId = id;
   fetch('/history/' + id).then(r => r.json()).then(d => {
+    _activeItem = d;
     const out = document.getElementById('report-out');
     const hdr = document.getElementById('report-header-text');
     const cb  = document.getElementById('copy-btn');
+    const eb  = document.getElementById('email-btn');
+    const vt  = document.getElementById('view-toggle');
     if (d.status === 'running') {
       hdr.textContent = 'Investigation running — see the Run tab for live output';
       out.textContent = 'The report will appear here when the investigation completes.';
       if (cb) cb.style.display = 'none';
+      if (eb) eb.style.display = 'none';
+      if (vt) vt.style.display = 'none';
     } else {
       hdr.textContent = d.label || d.id;
-      out.innerHTML = renderMD(d.report || '[No report available]');
+      const hasStruct = d.structured && Object.keys(d.structured).length > 0;
+      if (vt) vt.style.display = hasStruct ? 'flex' : 'none';
+      if (eb) eb.style.display = d.report ? 'inline-block' : 'none';
+      _activeView = hasStruct ? 'formatted' : 'raw';
+      _renderActiveView();
       out.scrollTop = 0;
       if (cb) cb.style.display = d.report ? 'inline-block' : 'none';
     }
     _renderHistory();
   });
+}
+
+function _renderActiveView() {
+  const out = document.getElementById('report-out');
+  const d = _activeItem;
+  if (!d) return;
+  const fmtBtn = document.getElementById('view-btn-fmt');
+  const rawBtn = document.getElementById('view-btn-raw');
+  if (fmtBtn) fmtBtn.classList.toggle('active', _activeView === 'formatted');
+  if (rawBtn) rawBtn.classList.toggle('active', _activeView === 'raw');
+  if (_activeView === 'formatted' && d.structured) {
+    out.innerHTML = renderStructured(d);
+  } else {
+    out.innerHTML = renderMD(d.report || '[No report available]');
+  }
+}
+
+function setView(v) { _activeView = v; _renderActiveView(); }
+
+// ── Structured report renderer ────────────────────────────────────────────────
+const _SEV_COLOR = {critical:'#f85149',high:'#f0883e',medium:'#d29922',
+                    low:'#3fb950',info:'#58a6ff'};
+
+function renderStructured(item) {
+  const s = item.structured;
+  if (!s) return '<div style="color:#8b949e;padding:20px">Structured view not available.</div>';
+
+  const sev = (s.severity || 'info').toLowerCase();
+  const sc  = _SEV_COLOR[sev] || '#58a6ff';
+
+  let html = `<div class="sr-sev-banner" style="--sc:${sc}">
+    <div class="sr-sev-label">Overall severity</div>
+    <div class="sr-sev-value">${esc(sev)}</div>
+  </div>`;
+
+  if (s.executive_summary) {
+    html += `<div class="sr-section">
+      <div class="sr-title">Executive Summary</div>
+      <div class="sr-body">${esc(s.executive_summary)}</div>
+    </div>`;
+  }
+
+  const hosts = (s.affected_hosts || []).filter(Boolean);
+  if (hosts.length) {
+    html += `<div class="sr-section">
+      <div class="sr-title">Affected Hosts</div>
+      <div>${hosts.map(h => `<span class="sr-chip">${esc(h)}</span>`).join('')}</div>
+    </div>`;
+  }
+
+  const findings = (s.key_findings || []).filter(Boolean);
+  if (findings.length) {
+    html += `<div class="sr-section"><div class="sr-title">Key Findings (${findings.length})</div>`;
+    for (const f of findings) {
+      const fs = (f.severity || 'info').toLowerCase();
+      const fc = _SEV_COLOR[fs] || '#58a6ff';
+      html += `<div class="sr-finding" style="--fc:${fc}">
+        <div class="sr-finding-title">
+          <span class="sr-sev-badge"
+            style="background:${fc}22;color:${fc};border-color:${fc}55">
+            ${esc((f.severity||'info').toUpperCase())}
+          </span>
+          ${esc(f.title || '')}
+        </div>
+        <div class="sr-finding-detail">${esc(f.detail || '')}</div>
+      </div>`;
+    }
+    html += '</div>';
+  }
+
+  const recs = (s.recommendations || []).filter(Boolean);
+  if (recs.length) {
+    html += `<div class="sr-section">
+      <div class="sr-title">Recommendations</div>
+      <ol class="sr-list">${recs.map(r => `<li>${esc(r)}</li>`).join('')}</ol>
+    </div>`;
+  }
+
+  const iocs = (s.iocs || []).filter(Boolean);
+  if (iocs.length) {
+    html += `<div class="sr-section">
+      <div class="sr-title">Indicators of Compromise</div>
+      <div>${iocs.map(i => `<code class="sr-ioc">${esc(i)}</code>`).join('')}</div>
+    </div>`;
+  }
+
+  return html;
+}
+
+// ── Email ─────────────────────────────────────────────────────────────────────
+function emailReport() {
+  if (!_activeId) return;
+  const eb = document.getElementById('email-btn');
+  eb.textContent = 'Sending…';
+  eb.disabled = true;
+  fetch('/email/' + _activeId, {method: 'POST'})
+    .then(r => r.json())
+    .then(d => {
+      if (d.ok) {
+        eb.textContent = 'Sent ✓';
+        setTimeout(() => { eb.textContent = 'Email'; eb.disabled = false; }, 3000);
+      } else {
+        eb.textContent = 'Failed';
+        eb.title = d.error || 'Unknown error';
+        setTimeout(() => { eb.textContent = 'Email'; eb.disabled = false; eb.title=''; }, 4000);
+      }
+    })
+    .catch(() => {
+      eb.textContent = 'Error';
+      setTimeout(() => { eb.textContent = 'Email'; eb.disabled = false; }, 3000);
+    });
 }
 
 function esc(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
