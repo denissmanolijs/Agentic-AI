@@ -1072,6 +1072,17 @@ function updateSched() {
   });
 }
 
+(function initSched() {
+  fetch('/status').then(r=>r.json()).then(d => {
+    const s = d.schedule;
+    document.getElementById('sched-on').checked = s.enabled;
+    document.getElementById('sched-hours').value = s.interval_hours;
+    document.getElementById('sched-window').value = s.hours;
+    document.getElementById('sched-status').textContent =
+      s.enabled ? 'On — every ' + s.interval_hours + 'h' : 'Off';
+  });
+})();
+
 setInterval(_loadHistoryData, 15000);
 </script>
 </body>
