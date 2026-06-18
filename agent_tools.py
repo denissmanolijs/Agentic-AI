@@ -545,10 +545,23 @@ TOOL_SCHEMAS = [schema for (_fn, schema) in TOOLS.values()]
 #  THE AGENTIC LOOP
 # ──────────────────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = (
+def _build_system_prompt():
+    _mgr = ag.C.get("WAZUH_MANAGER_NAME", "").strip()
+    _mgr_note = (
+        f" The Wazuh manager node is named '{_mgr}' (agent ID 000)."
+        if _mgr else ""
+    )
+    return (
     "You are an autonomous SOC analyst investigating a security question against "
     "a Wazuh deployment. You have tools to search alerts, aggregate them, pull a "
     "host's timeline, read host inventory, check rule baselines, and list agents.\n\n"
+    "WAZUH INFRASTRUCTURE — critical: In Wazuh, agent ID 000 is ALWAYS the Wazuh "
+    "manager (SIEM) itself, not a monitored endpoint. Alerts where agent.id=000 or "
+    "agent.name matches the manager hostname mean the SIEM node itself is the target "
+    "or source of the activity — treat this as high-priority since it is the security "
+    f"control plane.{_mgr_note} When you see agent ID 000 in any alert, explicitly "
+    "note in your analysis that this event occurred on the Wazuh manager, not a "
+    "monitored host.\n\n"
     "Work iteratively: decide which tool to call, read the result, then decide if "
     "you need more data or can conclude. Prefer starting broad (aggregate or "
     "search) then drilling into specific agents and timelines.\n\n"
@@ -601,6 +614,8 @@ SYSTEM_PROMPT = (
     "only AFTER you have done the investigation yourself. Be precise and cite the "
     "numbers your tools returned. Plain text, no markdown headers."
 )
+
+SYSTEM_PROMPT = _build_system_prompt()
 
 
 def run_agent(question: str, agent_id: str = None, emit=None):
