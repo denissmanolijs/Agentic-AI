@@ -158,11 +158,7 @@ JSON schema (use exactly these keys):
     {{"title": "short title", "severity": "critical|high|medium|low|info", "detail": "detail"}}
   ],
   "recommendations": ["action item"],
-  "iocs": ["ip/hash/username/domain — omit if none"],
-  "top_hosts": ["hostname (count) — top agents by alert volume, omit if none mentioned"],
-  "top_users": ["username (count) — top accounts by alert volume, omit if none mentioned"],
-  "top_ips": ["ip (count) — top source/dest IPs by alert volume, omit if none mentioned"],
-  "top_rules": ["rule or group name (count) — top rule groups by alert volume, omit if none mentioned"]
+  "iocs": ["ip/hash/username/domain — omit if none"]
 }}"""
 
 def _generate_structured(question, final, audit):
@@ -228,26 +224,6 @@ def _report_to_html(item, s):
         for i in (s.get("iocs") or []) if i)
     hosts = ", ".join(_he(h) for h in (s.get("affected_hosts") or []))
 
-    def pill(v):
-        return (f'<span style="display:inline-block;background:#f0f2f5;border:1px solid #dde1e7;'
-                f'border-radius:3px;padding:2px 8px;font-size:12px;color:#333;margin:2px 3px 2px 0">'
-                f'{_he(v)}</span>')
-
-    def top_row(label, items):
-        if not items:
-            return ""
-        return (f'<tr><td style="padding:4px 0;font-size:11px;font-weight:700;color:#666;'
-                f'white-space:nowrap;vertical-align:top;width:68px">{label}</td>'
-                f'<td style="padding:4px 0">{"".join(pill(v) for v in items)}</td></tr>')
-
-    top_rows = "".join([
-        top_row("Hosts",  s.get("top_hosts")  or []),
-        top_row("Users",  s.get("top_users")  or []),
-        top_row("IPs",    s.get("top_ips")    or []),
-        top_row("Rules",  s.get("top_rules")  or []),
-    ])
-    top_html = (f'<table border="0" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse">'
-                f'{top_rows}</table>') if top_rows else ""
 
     def tdsection(title, body):
         return (
@@ -291,7 +267,6 @@ table,td{{mso-table-lspace:0pt;mso-table-rspace:0pt}}
     </td>
   </tr>
   {tdsection("Executive Summary", exec_body)}
-  {tdsection("Top Results", top_html) if top_html else ""}
   {tdsection("Key Findings", findings_html) if findings_html else ""}
   {tdsection("Recommendations", f'<ol style="margin:0;padding-left:18px">{recs_html}</ol>') if recs_html else ""}
   {tdsection("Indicators of Compromise", f'<ul style="margin:0;padding-left:18px">{iocs_html}</ul>') if iocs_html else ""}
