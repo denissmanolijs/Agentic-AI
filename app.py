@@ -133,8 +133,16 @@ def _run_agentic(question, run_id, q=None):
 
 # ── Structured report generation ──────────────────────────────────────────────
 _STRUCT_PROMPT = """\
-You are a security report formatter. Given the investigation question and analyst findings, \
-produce a structured JSON report. Return ONLY valid JSON — no markdown, no explanation.
+You are a deterministic report formatter. Your only task is to extract facts from the \
+analyst findings below into JSON.
+
+Do not perform additional analysis.
+Do not reinterpret findings.
+Do not change severity.
+Do not downgrade or upgrade risk.
+Do not infer facts not explicitly stated.
+
+Return ONLY valid JSON — no markdown, no explanation.
 
 QUESTION: {question}
 
