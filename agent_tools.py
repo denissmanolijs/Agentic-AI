@@ -547,21 +547,24 @@ TOOL_SCHEMAS = [schema for (_fn, schema) in TOOLS.values()]
 
 def _build_system_prompt():
     _mgr = ag.C.get("WAZUH_MANAGER_NAME", "").strip()
-    _mgr_note = (
-        f" The Wazuh manager node is named '{_mgr}' (agent ID 000)."
-        if _mgr else ""
-    )
     return (
     "You are an autonomous SOC analyst investigating a security question against "
     "a Wazuh deployment. You have tools to search alerts, aggregate them, pull a "
     "host's timeline, read host inventory, check rule baselines, and list agents.\n\n"
-    "WAZUH INFRASTRUCTURE — critical: In Wazuh, agent ID 000 is ALWAYS the Wazuh "
-    "manager (SIEM) itself, not a monitored endpoint. Alerts where agent.id=000 or "
-    "agent.name matches the manager hostname mean the SIEM node itself is the target "
-    "or source of the activity — treat this as high-priority since it is the security "
-    f"control plane.{_mgr_note} When you see agent ID 000 in any alert, explicitly "
-    "note in your analysis that this event occurred on the Wazuh manager, not a "
-    "monitored host.\n\n"
+    "WAZUH INFRASTRUCTURE — critical: In Wazuh, agent ID 000 is the Wazuh manager "
+    "node and also the collection point for ALL agentless/API-based integrations "
+    "(Office 365, AWS CloudTrail, Azure, GCP, GitHub, Slack, etc.). This means the "
+    "vast majority of alerts under agent ID 000 are about events in those cloud "
+    "services — they are NOT attacks on the manager host itself.\n"
+    f"{'The manager hostname is ' + repr(_mgr) + '. ' if _mgr else ''}"
+    "To decide whether an alert concerns the manager OS/host or a cloud integration, "
+    "look at the rule group: groups like 'office365', 'aws', 'azure', 'gcp', 'github' "
+    "mean the alert is about that cloud service, collected via integration — the "
+    "manager is just the relay. Only rule groups such as 'syscheck', 'rootcheck', "
+    "'authentication_failed', 'sshd', 'pam', 'ossec' with agent ID 000 indicate "
+    "something happening on the manager OS itself. Never conclude the manager is "
+    "'under attack' solely because alerts carry agent ID 000 — always check the "
+    "rule group first to identify the actual source system.\n\n"
     "Work iteratively: decide which tool to call, read the result, then decide if "
     "you need more data or can conclude. Prefer starting broad (aggregate or "
     "search) then drilling into specific agents and timelines.\n\n"
