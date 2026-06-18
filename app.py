@@ -31,7 +31,7 @@ class State:
     def __init__(self):
         self.lock       = threading.Lock()   # one investigation at a time
         self.log_file   = ""
-        self.sched_cfg  = {"enabled": False, "interval_hours": 8, "hours": 24}
+        self.sched_cfg  = {"enabled": False, "interval_hours": 8, "hours": 24, "auto_email": False}
         self.sched_wake = threading.Event()
         self.history    = OrderedDict()
         self.hist_lock  = threading.Lock()
@@ -450,6 +450,13 @@ def _scheduler():
                 }
             try:
                 _run_agentic(question, run_id, q=None)
+                if cfg.get("auto_email"):
+                    with ST.hist_lock:
+                        item = ST.history.get(run_id)
+                    if item:
+                        ok, err = _send_email(item)
+                        if not ok:
+                            log.warning("Auto-email failed for %s: %s", run_id, err)
             finally:
                 ST.lock.release()
                 ST._last_sched = time.time()
@@ -672,6 +679,11 @@ input:checked+.slider:before{transform:translateX(14px)}
         onchange="updateSched()">
       <span class="si">hours of events</span>
       <span class="si" id="sched-status" style="margin-left:4px">Off</span>
+      <label class="toggle" style="margin-left:12px" title="Auto-send report by email after each scheduled run">
+        <input type="checkbox" id="sched-email" onchange="updateSched()">
+        <span class="slider"></span>
+      </label>
+      <span class="si">Email report</span>
     </div>
 
     <div class="live-wrap">
@@ -1094,6 +1106,7 @@ function updateSched() {
       enabled:        document.getElementById('sched-on').checked,
       interval_hours: +document.getElementById('sched-hours').value,
       hours:          +document.getElementById('sched-window').value,
+      auto_email:     document.getElementById('sched-email').checked,
     })
   }).then(r=>r.json()).then(d => {
     document.getElementById('sched-status').textContent =
@@ -1107,6 +1120,7 @@ function updateSched() {
     document.getElementById('sched-on').checked = s.enabled;
     document.getElementById('sched-hours').value = s.interval_hours;
     document.getElementById('sched-window').value = s.hours;
+    document.getElementById('sched-email').checked = s.auto_email || false;
     document.getElementById('sched-status').textContent =
       s.enabled ? 'On — every ' + s.interval_hours + 'h' : 'Off';
   });
