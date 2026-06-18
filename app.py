@@ -35,9 +35,11 @@ class State:
         self.sched_wake = threading.Event()
         self.history    = OrderedDict()
         self.hist_lock  = threading.Lock()
-        self.hist_file  = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "investigations.json")
+        _base = os.path.dirname(os.path.abspath(__file__))
+        self.hist_file  = os.path.join(_base, "investigations.json")
+        self.sched_file = os.path.join(_base, "sched_cfg.json")
         self._load_history()
+        self._load_sched()
 
     def _load_history(self):
         try:
@@ -54,6 +56,21 @@ class State:
             Path(self.hist_file).write_text(json.dumps(items, indent=2))
         except Exception as e:
             log.warning("Could not save history: %s", e)
+
+    def _load_sched(self):
+        try:
+            if Path(self.sched_file).exists():
+                saved = json.loads(Path(self.sched_file).read_text())
+                self.sched_cfg.update(saved)
+                log.info("Loaded scheduler config: %s", self.sched_cfg)
+        except Exception as e:
+            log.warning("Could not load scheduler config: %s", e)
+
+    def _save_sched(self):
+        try:
+            Path(self.sched_file).write_text(json.dumps(self.sched_cfg, indent=2))
+        except Exception as e:
+            log.warning("Could not save scheduler config: %s", e)
 
 ST = State()
 
@@ -140,7 +157,9 @@ Do not perform additional analysis.
 Do not reinterpret findings.
 Do not change severity.
 Do not downgrade or upgrade risk.
-Do not infer facts not explicitly stated.
+Extract and structure only what the analyst explicitly stated. You may compress and \
+summarise the analyst's own words for the executive_summary field. Do not add findings, \
+IOCs, hosts, or severity levels that are not present in the findings text.
 
 Return ONLY valid JSON — no markdown, no explanation.
 
@@ -426,6 +445,7 @@ def email_report(run_id):
 @app.route("/schedule", methods=["POST"])
 def set_schedule():
     ST.sched_cfg.update(request.get_json() or {})
+    ST._save_sched()
     ST.sched_wake.set()
     return jsonify(ST.sched_cfg)
 
