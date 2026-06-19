@@ -3,7 +3,7 @@ import html as _html
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from collections import OrderedDict
 from flask import Flask, Response, request, render_template_string, jsonify
@@ -31,7 +31,7 @@ class State:
     def __init__(self):
         self.lock       = threading.Lock()   # one investigation at a time
         self.log_file   = ""
-        self.sched_cfg  = {"enabled": False, "interval_hours": 8, "hours": 24, "auto_email": False}
+        self.sched_cfg  = {"enabled": False, "interval_hours": 8, "hours": 24, "auto_email": False, "start_time": ""}
         self.sched_wake = threading.Event()
         self.history    = OrderedDict()
         self.hist_lock  = threading.Lock()
@@ -447,24 +447,49 @@ def set_schedule():
     ST.sched_cfg.update(request.get_json() or {})
     ST._save_sched()
     ST.sched_wake.set()
-    return jsonify(ST.sched_cfg)
+    return jsonify({**ST.sched_cfg, "next_run": _fmt_next_run(ST.sched_cfg)})
 
 
 @app.route("/status")
 def status():
     return jsonify({"running": ST.lock.locked(), "model": AGENTIC_MODEL,
-                    "schedule": ST.sched_cfg})
+                    "schedule": {**ST.sched_cfg, "next_run": _fmt_next_run(ST.sched_cfg)}})
 
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
+def _next_run_ts(cfg):
+    """Return the unix timestamp when the next scheduled run should fire."""
+    last = getattr(ST, "_last_sched", 0)
+    interval = cfg.get("interval_hours", 8) * 3600
+    start_time = cfg.get("start_time", "").strip()
+    if last > 0:
+        return last + interval
+    if start_time:
+        try:
+            h, m = map(int, start_time.split(":"))
+            target = datetime.now().replace(hour=h, minute=m, second=0, microsecond=0)
+            if target.timestamp() <= time.time():
+                target += timedelta(days=1)
+            return target.timestamp()
+        except ValueError:
+            pass
+    return time.time()
+
+
+def _fmt_next_run(cfg):
+    """Return a human-readable next-run string, or '' if scheduler is off."""
+    if not cfg.get("enabled"):
+        return ""
+    return datetime.fromtimestamp(_next_run_ts(cfg)).strftime("%Y-%m-%d %H:%M")
+
+
 def _scheduler():
     """Fires an agentic triage on a timer: 'perform alert triage on the last N hours'."""
     while True:
         cfg = ST.sched_cfg
         if not cfg["enabled"]:
             ST.sched_wake.wait(60); ST.sched_wake.clear(); continue
-        last = getattr(ST, "_last_sched", 0)
-        wait = max(0, last + cfg["interval_hours"]*3600 - time.time())
+        wait = max(0, _next_run_ts(cfg) - time.time())
         if wait > 0:
             ST.sched_wake.wait(wait); ST.sched_wake.clear(); continue
         if ST.lock.acquire(blocking=False):
@@ -706,7 +731,10 @@ input:checked+.slider:before{transform:translateX(14px)}
       <span class="si">hours — over the last</span>
       <input type="number" id="sched-window" value="24" min="1" max="336"
         onchange="updateSched()">
-      <span class="si">hours of events</span>
+      <span class="si">hours of events — starting at</span>
+      <input type="time" id="sched-start" onchange="updateSched()"
+        style="background:#0d1117;border:1px solid #30363d;border-radius:5px;
+               color:#e6edf3;font-size:12px;padding:3px 6px;width:90px">
       <span class="si" id="sched-status" style="margin-left:4px">Off</span>
       <label class="toggle" style="margin-left:12px" title="Auto-send report by email after each scheduled run">
         <input type="checkbox" id="sched-email" onchange="updateSched()">
@@ -1136,10 +1164,11 @@ function updateSched() {
       interval_hours: +document.getElementById('sched-hours').value,
       hours:          +document.getElementById('sched-window').value,
       auto_email:     document.getElementById('sched-email').checked,
+      start_time:     document.getElementById('sched-start').value,
     })
   }).then(r=>r.json()).then(d => {
     document.getElementById('sched-status').textContent =
-      d.enabled ? 'On — every ' + d.interval_hours + 'h' : 'Off';
+      d.enabled ? 'On — next: ' + (d.next_run || '…') : 'Off';
   });
 }
 
@@ -1150,8 +1179,9 @@ function updateSched() {
     document.getElementById('sched-hours').value = s.interval_hours;
     document.getElementById('sched-window').value = s.hours;
     document.getElementById('sched-email').checked = s.auto_email || false;
+    document.getElementById('sched-start').value = s.start_time || '';
     document.getElementById('sched-status').textContent =
-      s.enabled ? 'On — every ' + s.interval_hours + 'h' : 'Off';
+      s.enabled ? 'On — next: ' + (s.next_run || '…') : 'Off';
   });
 })();
 
