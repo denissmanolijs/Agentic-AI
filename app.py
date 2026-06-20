@@ -462,8 +462,8 @@ def _next_run_ts(cfg):
     last = getattr(ST, "_last_sched", 0)
     interval = cfg.get("interval_hours", 8) * 3600
     start_time = cfg.get("start_time", "").strip()
-    if start_time:
-        # start_time respected on every run: find next future HH:MM occurrence
+    if last == 0 and start_time:
+        # First run: wait until the specified time of day
         try:
             h, m = map(int, start_time.split(":"))
             target = datetime.now().replace(hour=h, minute=m, second=0, microsecond=0)
@@ -472,10 +472,11 @@ def _next_run_ts(cfg):
             return target.timestamp()
         except ValueError:
             pass
-    # No start_time: rolling interval anchored to run START time
+    # Subsequent runs, or no start_time: roll from last run start
     if last > 0:
         return last + interval
-    return time.time()
+    # Never run and no start_time: wait one full interval before first run
+    return time.time() + interval
 
 
 def _fmt_next_run(cfg):
