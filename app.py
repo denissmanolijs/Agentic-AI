@@ -462,9 +462,8 @@ def _next_run_ts(cfg):
     last = getattr(ST, "_last_sched", 0)
     interval = cfg.get("interval_hours", 8) * 3600
     start_time = cfg.get("start_time", "").strip()
-    if last > 0:
-        return last + interval
     if start_time:
+        # start_time respected on every run: find next future HH:MM occurrence
         try:
             h, m = map(int, start_time.split(":"))
             target = datetime.now().replace(hour=h, minute=m, second=0, microsecond=0)
@@ -473,6 +472,9 @@ def _next_run_ts(cfg):
             return target.timestamp()
         except ValueError:
             pass
+    # No start_time: rolling interval anchored to run START time
+    if last > 0:
+        return last + interval
     return time.time()
 
 
@@ -493,6 +495,7 @@ def _scheduler():
         if wait > 0:
             ST.sched_wake.wait(wait); ST.sched_wake.clear(); continue
         if ST.lock.acquire(blocking=False):
+            ST._last_sched = time.time()   # anchor BEFORE run so interval doesn't drift
             run_id   = "sched_" + datetime.now().strftime("%Y%m%d_%H%M%S")
             hours    = cfg.get("hours", 24)
             question = f"perform alert triage on the last {hours} hours"
@@ -513,7 +516,6 @@ def _scheduler():
                             log.warning("Auto-email failed for %s: %s", run_id, err)
             finally:
                 ST.lock.release()
-                ST._last_sched = time.time()
 
 
 # ── Page ──────────────────────────────────────────────────────────────────────
