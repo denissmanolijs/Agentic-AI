@@ -431,6 +431,38 @@ def delete_report(run_id):
     return jsonify({"ok": True})
 
 
+@app.route("/history/<run_id>/structured", methods=["POST"])
+def regenerate_structured_report(run_id):
+    with ST.hist_lock:
+        item = ST.history.get(run_id)
+    if not item:
+        return jsonify({"error": "not found"}), 404
+    if item.get("status") == "running":
+        return jsonify({"error": "investigation still running"}), 409
+    report = item.get("report", "")
+    if not report:
+        return jsonify({"error": "no report text"}), 400
+    # Extract question and final answer from the stored report
+    question = ""
+    final = report
+    if report.startswith("QUESTION: "):
+        parts = report.split("\n\n", 2)
+        question = parts[0][len("QUESTION: "):]
+        final = parts[2] if len(parts) > 2 else report
+    # Strip tool-call audit trail footer
+    marker = "\nTOOL-CALL AUDIT TRAIL"
+    if marker in final:
+        final = final[:final.index(marker)].rstrip()
+    structured = _generate_structured(question, final, [])
+    if not structured:
+        return jsonify({"error": "structured generation failed — check Ollama logs"}), 500
+    with ST.hist_lock:
+        if run_id in ST.history:
+            ST.history[run_id]["structured"] = structured
+            ST._save_history()
+    return jsonify({"ok": True, "structured": structured})
+
+
 @app.route("/email/<run_id>", methods=["POST"])
 def email_report(run_id):
     with ST.hist_lock:
@@ -972,6 +1004,15 @@ function showReport(id) {
       _renderActiveView();
       out.scrollTop = 0;
       if (cb) cb.style.display = d.report ? 'inline-block' : 'none';
+      // Auto-regenerate structured data for old reports that are missing it
+      if (!hasStruct && d.report && d.status === 'completed') {
+        fetch('/history/' + id + '/structured', {method:'POST'})
+          .then(r => r.json()).then(r => {
+            if (r.ok) { d.structured = r.structured; _activeItem = d;
+              if (vt) vt.style.display = 'flex';
+              _activeView = 'formatted'; _renderActiveView(); }
+          }).catch(() => {});
+      }
     }
     _renderHistory();
   });
