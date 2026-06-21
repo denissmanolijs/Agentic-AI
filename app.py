@@ -192,7 +192,7 @@ def _generate_structured(question, final, audit):
             model=ag.C["AGENTIC_MODEL"],
             messages=[{"role": "user",
                        "content": _STRUCT_PROMPT.replace("{question}", question).replace("{final}", final)}],
-            options={"temperature": 0.1},
+            options={"temperature": 0.1, "think": False},
         )
         text = (resp.get("message") or {}).get("content", "").strip()
         # Strip markdown code fences if the model wraps the JSON
