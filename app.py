@@ -191,7 +191,7 @@ def _generate_structured(question, final, audit):
         resp = cl.chat(
             model=ag.C["AGENTIC_MODEL"],
             messages=[{"role": "user",
-                       "content": _STRUCT_PROMPT.format(question=question, final=final)}],
+                       "content": _STRUCT_PROMPT.replace("{question}", question).replace("{final}", final)}],
             options={"temperature": 0.1},
         )
         text = (resp.get("message") or {}).get("content", "").strip()
