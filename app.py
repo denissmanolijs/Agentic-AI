@@ -31,8 +31,9 @@ class State:
     def __init__(self):
         self.lock       = threading.Lock()   # one investigation at a time
         self.log_file   = ""
-        self.sched_cfg  = {"enabled": False, "interval_hours": 8, "hours": 24, "auto_email": False, "start_time": ""}
-        self.sched_wake = threading.Event()
+        self.sched_cfg    = {"enabled": False, "interval_hours": 8, "hours": 24, "auto_email": False, "start_time": ""}
+        self.sched_wake   = threading.Event()
+        self._sched_target = 0   # committed next-run unix ts; 0 = needs recompute
         self.history    = OrderedDict()
         self.hist_lock  = threading.Lock()
         _base = os.path.dirname(os.path.abspath(__file__))
@@ -445,6 +446,7 @@ def email_report(run_id):
 @app.route("/schedule", methods=["POST"])
 def set_schedule():
     ST.sched_cfg.update(request.get_json() or {})
+    ST._sched_target = 0   # force recompute with new config
     ST._save_sched()
     ST.sched_wake.set()
     return jsonify({**ST.sched_cfg, "next_run": _fmt_next_run(ST.sched_cfg)})
@@ -483,7 +485,8 @@ def _fmt_next_run(cfg):
     """Return a human-readable next-run string, or '' if scheduler is off."""
     if not cfg.get("enabled"):
         return ""
-    return datetime.fromtimestamp(_next_run_ts(cfg)).strftime("%Y-%m-%d %H:%M")
+    ts = ST._sched_target if ST._sched_target > 0 else _next_run_ts(cfg)
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
 
 
 def _scheduler():
@@ -491,12 +494,17 @@ def _scheduler():
     while True:
         cfg = ST.sched_cfg
         if not cfg["enabled"]:
+            ST._sched_target = 0
             ST.sched_wake.wait(60); ST.sched_wake.clear(); continue
-        wait = max(0, _next_run_ts(cfg) - time.time())
+        # Compute and cache the target once; don't recalculate until after a run fires
+        if ST._sched_target == 0:
+            ST._sched_target = _next_run_ts(cfg)
+        wait = max(0, ST._sched_target - time.time())
         if wait > 0:
-            ST.sched_wake.wait(wait); ST.sched_wake.clear(); continue
+            ST.sched_wake.wait(min(wait, 3600)); ST.sched_wake.clear(); continue
         if ST.lock.acquire(blocking=False):
             ST._last_sched = time.time()   # anchor BEFORE run so interval doesn't drift
+            ST._sched_target = 0           # clear so next target is recomputed after run
             run_id   = "sched_" + datetime.now().strftime("%Y%m%d_%H%M%S")
             hours    = cfg.get("hours", 24)
             question = f"perform alert triage on the last {hours} hours"
@@ -724,8 +732,8 @@ input:checked+.slider:before{transform:translateX(14px)}
     </div>
 
     <div class="sched-bar">
-      <label class="toggle">
-        <input type="checkbox" id="sched-on" onchange="updateSched()">
+      <label class="toggle" id="sched-on-label" title="Set a first-run time before enabling">
+        <input type="checkbox" id="sched-on" onchange="updateSched()" disabled>
         <span class="slider"></span>
       </label>
       <span class="si">Auto-run triage every</span>
@@ -734,7 +742,7 @@ input:checked+.slider:before{transform:translateX(14px)}
       <span class="si">hours — over the last</span>
       <input type="number" id="sched-window" value="24" min="1" max="336"
         onchange="updateSched()">
-      <span class="si">hours of events — starting at</span>
+      <span class="si">hours of events — first run at</span>
       <input type="time" id="sched-start" onchange="updateSched()"
         style="background:#0d1117;border:1px solid #30363d;border-radius:5px;
                color:#e6edf3;font-size:12px;padding:3px 6px;width:90px">
@@ -1160,14 +1168,21 @@ function copyLive() {
 
 // ── Scheduler ────────────────────────────────────────────────────────────────
 function updateSched() {
+  const startTime = document.getElementById('sched-start').value;
+  const toggle    = document.getElementById('sched-on');
+  const label     = document.getElementById('sched-on-label');
+  const hasTime   = !!startTime;
+  toggle.disabled = !hasTime;
+  label.title     = hasTime ? '' : 'Set a first-run time before enabling';
+  if (!hasTime) toggle.checked = false;
   fetch('/schedule', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({
-      enabled:        document.getElementById('sched-on').checked,
+      enabled:        toggle.checked,
       interval_hours: +document.getElementById('sched-hours').value,
       hours:          +document.getElementById('sched-window').value,
       auto_email:     document.getElementById('sched-email').checked,
-      start_time:     document.getElementById('sched-start').value,
+      start_time:     startTime,
     })
   }).then(r=>r.json()).then(d => {
     document.getElementById('sched-status').textContent =
@@ -1178,11 +1193,14 @@ function updateSched() {
 (function initSched() {
   fetch('/status').then(r=>r.json()).then(d => {
     const s = d.schedule;
-    document.getElementById('sched-on').checked = s.enabled;
+    const hasTime = !!(s.start_time || '');
+    document.getElementById('sched-start').value = s.start_time || '';
+    document.getElementById('sched-on').disabled = !hasTime;
+    document.getElementById('sched-on-label').title = hasTime ? '' : 'Set a first-run time before enabling';
+    document.getElementById('sched-on').checked = s.enabled && hasTime;
     document.getElementById('sched-hours').value = s.interval_hours;
     document.getElementById('sched-window').value = s.hours;
     document.getElementById('sched-email').checked = s.auto_email || false;
-    document.getElementById('sched-start').value = s.start_time || '';
     document.getElementById('sched-status').textContent =
       s.enabled ? 'On — next: ' + (s.next_run || '…') : 'Off';
   });
