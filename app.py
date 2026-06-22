@@ -62,6 +62,7 @@ class State:
         try:
             if Path(self.sched_file).exists():
                 saved = json.loads(Path(self.sched_file).read_text())
+                self._last_sched = saved.pop("_last_sched", 0)
                 self.sched_cfg.update(saved)
                 log.info("Loaded scheduler config: %s", self.sched_cfg)
         except Exception as e:
@@ -69,7 +70,8 @@ class State:
 
     def _save_sched(self):
         try:
-            Path(self.sched_file).write_text(json.dumps(self.sched_cfg, indent=2))
+            data = {**self.sched_cfg, "_last_sched": getattr(self, "_last_sched", 0)}
+            Path(self.sched_file).write_text(json.dumps(data, indent=2))
         except Exception as e:
             log.warning("Could not save scheduler config: %s", e)
 
@@ -477,7 +479,11 @@ def email_report(run_id):
 
 @app.route("/schedule", methods=["POST"])
 def set_schedule():
-    ST.sched_cfg.update(request.get_json() or {})
+    data = request.get_json() or {}
+    # Changing start_time reschedules from scratch so the new time is honoured
+    if "start_time" in data and data["start_time"] != ST.sched_cfg.get("start_time", ""):
+        ST._last_sched = 0
+    ST.sched_cfg.update(data)
     ST._sched_target = 0   # force recompute with new config
     ST._save_sched()
     ST.sched_wake.set()
@@ -537,6 +543,7 @@ def _scheduler():
         if ST.lock.acquire(blocking=False):
             ST._last_sched = time.time()   # anchor BEFORE run so interval doesn't drift
             ST._sched_target = 0           # clear so next target is recomputed after run
+            ST._save_sched()               # persist so restart doesn't lose the anchor
             run_id   = "sched_" + datetime.now().strftime("%Y%m%d_%H%M%S")
             hours    = cfg.get("hours", 24)
             question = f"perform alert triage on the last {hours} hours"
