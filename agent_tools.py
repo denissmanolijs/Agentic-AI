@@ -545,8 +545,13 @@ TOOL_SCHEMAS = [schema for (_fn, schema) in TOOLS.values()]
 #  THE AGENTIC LOOP
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _build_system_prompt():
-    _mgr = ag.C.get("WAZUH_MANAGER_NAME", "").strip()
+def _build_system_prompt(mgr_name=None, notes=None):
+    _mgr = mgr_name.strip() if mgr_name else ""
+    _notes = (notes or "").strip()
+    _notes_section = (
+        "\nENVIRONMENT CONTEXT — additional context provided by the operator:\n"
+        + _notes + "\n"
+    ) if _notes else ""
     return (
     "You are an autonomous SOC analyst investigating a security question against "
     "a Wazuh deployment. You have tools to search alerts, aggregate them, pull a "
@@ -564,8 +569,9 @@ def _build_system_prompt():
     "'authentication_failed', 'sshd', 'pam', 'ossec' with agent ID 000 indicate "
     "something happening on the manager OS itself. Never conclude the manager is "
     "'under attack' solely because alerts carry agent ID 000 — always check the "
-    "rule group first to identify the actual source system.\n\n"
-    "Work iteratively: decide which tool to call, read the result, then decide if "
+    "rule group first to identify the actual source system.\n"
+    + _notes_section +
+    "\nWork iteratively: decide which tool to call, read the result, then decide if "
     "you need more data or can conclude. Prefer starting broad (aggregate or "
     "search) then drilling into specific agents and timelines.\n\n"
     "TIME WINDOWS — critical: if the user gives no timeframe, default to a BROAD "
@@ -621,7 +627,7 @@ def _build_system_prompt():
 SYSTEM_PROMPT = _build_system_prompt()
 
 
-def run_agent(question: str, agent_id: str = None, emit=None):
+def run_agent(question: str, agent_id: str = None, emit=None, context=None):
     """
     Run the agentic investigation loop.
 
@@ -630,6 +636,8 @@ def run_agent(question: str, agent_id: str = None, emit=None):
     emit     : optional callback(event_type, payload) for streaming to a UI.
                event_type is one of: 'thinking', 'tool_call', 'tool_result',
                'answer', 'done', 'error'. If None, prints to stdout.
+    context  : optional dict with keys 'manager_name' and 'notes' from the
+               Context tab; overrides WAZUH_MANAGER_NAME from .env.
 
     Returns the final answer string.
     """
@@ -653,12 +661,18 @@ def run_agent(question: str, agent_id: str = None, emit=None):
 
     client = ollama.Client(host=OL_HOST)
 
+    ctx = context or {}
+    system_prompt = _build_system_prompt(
+        mgr_name=ctx.get("manager_name"),
+        notes=ctx.get("notes"),
+    )
+
     user_msg = question
     if agent_id:
         user_msg = f"(Focus on agent {agent_id}.) {question}"
 
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user",   "content": user_msg},
     ]
 

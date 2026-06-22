@@ -6,6 +6,7 @@ __pycache__/
 # Runtime state
 investigations.json
 sched_cfg.json
+context_cfg.json
 agent.pid
 client.log
 *.cache

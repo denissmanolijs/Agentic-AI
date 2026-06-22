@@ -26,8 +26,6 @@ C = {
     "AGENTIC_MAX_STEPS": int(os.getenv("AGENTIC_MAX_STEPS", "18")),
     "UI_PORT": int(os.getenv("UI_PORT", "5000")),
     "UI_HOST": os.getenv("UI_HOST", "0.0.0.0"),
-    # Wazuh environment metadata (optional — improves AI context)
-    "WAZUH_MANAGER_NAME": os.getenv("WAZUH_MANAGER_NAME", ""),
     # Email delivery (all optional — leave blank to disable)
     "SMTP_HOST": os.getenv("SMTP_HOST", ""),
     "SMTP_PORT": int(os.getenv("SMTP_PORT", "587")),

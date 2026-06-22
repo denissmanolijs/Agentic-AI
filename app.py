@@ -34,13 +34,16 @@ class State:
         self.sched_cfg    = {"enabled": False, "interval_hours": 8, "hours": 24, "auto_email": False, "start_time": ""}
         self.sched_wake   = threading.Event()
         self._sched_target = 0   # committed next-run unix ts; 0 = needs recompute
+        self.context_cfg  = {"manager_name": "", "notes": ""}
         self.history    = OrderedDict()
         self.hist_lock  = threading.Lock()
         _base = os.path.dirname(os.path.abspath(__file__))
-        self.hist_file  = os.path.join(_base, "investigations.json")
-        self.sched_file = os.path.join(_base, "sched_cfg.json")
+        self.hist_file    = os.path.join(_base, "investigations.json")
+        self.sched_file   = os.path.join(_base, "sched_cfg.json")
+        self.context_file = os.path.join(_base, "context_cfg.json")
         self._load_history()
         self._load_sched()
+        self._load_context()
 
     def _load_history(self):
         try:
@@ -74,6 +77,21 @@ class State:
             Path(self.sched_file).write_text(json.dumps(data, indent=2))
         except Exception as e:
             log.warning("Could not save scheduler config: %s", e)
+
+    def _load_context(self):
+        try:
+            if Path(self.context_file).exists():
+                saved = json.loads(Path(self.context_file).read_text())
+                self.context_cfg.update(saved)
+                log.info("Loaded context config")
+        except Exception as e:
+            log.warning("Could not load context config: %s", e)
+
+    def _save_context(self):
+        try:
+            Path(self.context_file).write_text(json.dumps(self.context_cfg, indent=2))
+        except Exception as e:
+            log.warning("Could not save context config: %s", e)
 
 ST = State()
 
@@ -115,7 +133,7 @@ def _run_agentic(question, run_id, q=None):
 
     final = ""
     try:
-        final = agent.run_agent(question, emit=emit)
+        final = agent.run_agent(question, emit=emit, context=ST.context_cfg)
     except Exception as e:
         log.exception("Agentic run failed")
         if q is not None:
@@ -490,6 +508,19 @@ def set_schedule():
     return jsonify({**ST.sched_cfg, "next_run": _fmt_next_run(ST.sched_cfg)})
 
 
+@app.route("/context", methods=["GET"])
+def get_context():
+    return jsonify(ST.context_cfg)
+
+
+@app.route("/context", methods=["POST"])
+def set_context():
+    data = request.get_json() or {}
+    ST.context_cfg.update({k: v for k, v in data.items() if k in ST.context_cfg})
+    ST._save_context()
+    return jsonify({"ok": True})
+
+
 @app.route("/status")
 def status():
     return jsonify({"running": ST.lock.locked(), "model": AGENTIC_MODEL,
@@ -735,6 +766,26 @@ input:checked+.slider:before{transform:translateX(14px)}
   border:1px solid #30363d;border-radius:4px;cursor:pointer;transition:color .15s}
 .email-btn:hover:not(:disabled){color:#e6edf3}
 .email-btn:disabled{opacity:.45;cursor:not-allowed}
+
+/* Context tab */
+.context-tab{flex:1;overflow-y:auto;padding:28px 32px;max-width:760px}
+.ctx-section{margin-bottom:28px}
+.ctx-label{font-size:11px;font-weight:700;color:#8b949e;text-transform:uppercase;
+  letter-spacing:.07em;margin-bottom:8px;display:block}
+.ctx-desc{font-size:12px;color:#484f58;margin-bottom:8px;line-height:1.5}
+.ctx-input{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;
+  color:#e6edf3;font-size:13px;padding:8px 12px;font-family:monospace}
+.ctx-input:focus{outline:none;border-color:#58a6ff}
+.ctx-textarea{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;
+  color:#e6edf3;font-size:12px;padding:10px 12px;font-family:monospace;
+  resize:vertical;min-height:220px;line-height:1.6}
+.ctx-textarea:focus{outline:none;border-color:#58a6ff}
+.ctx-save{background:#1f6feb;border:none;border-radius:5px;color:#fff;
+  font-size:12px;padding:7px 20px;cursor:pointer;transition:opacity .15s}
+.ctx-save:hover{opacity:.85}
+.ctx-status{font-size:11px;color:#484f58;margin-left:10px}
+.ctx-hint{font-size:11px;color:#484f58;background:#161b22;border:1px solid #21262d;
+  border-radius:5px;padding:10px 14px;margin-bottom:24px;line-height:1.6}
 </style>
 </head>
 <body>
@@ -748,6 +799,9 @@ input:checked+.slider:before{transform:translateX(14px)}
     </div>
     <div class="hdr-tab" id="tab-reports-btn" onclick="switchTab('reports')">
       Reports
+    </div>
+    <div class="hdr-tab" id="tab-context-btn" onclick="switchTab('context')">
+      Context
     </div>
   </div>
 </header>
@@ -845,6 +899,49 @@ input:checked+.slider:before{transform:translateX(14px)}
   </div>
 </div>
 
+<!-- ── CONTEXT TAB ── -->
+<div class="tab" id="tab-context">
+  <div class="context-tab">
+    <div class="ctx-hint">
+      Everything saved here is injected into the AI agent&#39;s system prompt at the
+      start of every investigation. Use it to describe your environment so the
+      agent can make better-informed decisions — known-good hosts, service roles,
+      exclusion rules, expected noise sources, etc.
+    </div>
+
+    <div class="ctx-section">
+      <label class="ctx-label" for="ctx-manager">Wazuh Manager Hostname</label>
+      <div class="ctx-desc">
+        The hostname of the Wazuh manager node. When set, the agent knows which
+        hostname corresponds to agent ID 000 (the manager / cloud relay).
+      </div>
+      <input id="ctx-manager" class="ctx-input" type="text"
+        placeholder="e.g. wazuh-manager.internal"
+        autocomplete="off" spellcheck="false">
+    </div>
+
+    <div class="ctx-section">
+      <label class="ctx-label" for="ctx-notes">Environment Notes</label>
+      <div class="ctx-desc">
+        Free-form context injected verbatim into the system prompt. Describe
+        known-good behaviour, exclusions, server roles, expected traffic
+        patterns — anything that helps the agent distinguish noise from threats.
+      </div>
+      <textarea id="ctx-notes" class="ctx-textarea"
+        placeholder="Examples:
+- 10.0.0.50 is a vulnerability scanner; its outbound port-scan traffic is expected and should not be treated as malicious.
+- Server lv01semvp001 (agent 000) is the Wazuh manager + Office 365 relay; alerts with rule group 'office365' originate from O365, not from the manager OS.
+- User svc_backup performs nightly file access on all hosts between 02:00-04:00 UTC; this is expected.
+- Hosts in the 192.168.10.0/24 range are dev workstations and typically generate high authentication noise."></textarea>
+    </div>
+
+    <div style="display:flex;align-items:center">
+      <button class="ctx-save" onclick="saveContext()">Save</button>
+      <span class="ctx-status" id="ctx-status"></span>
+    </div>
+  </div>
+</div>
+
 <script>
 let _es=null, _running=false, _t0=0, _timer=null, _liveBuffer='',
     _pendingQ=null, _histData=[], _activeId=null, _curRunId=null,
@@ -856,6 +953,7 @@ function switchTab(name) {
   document.getElementById('tab-' + name).classList.add('active');
   document.getElementById('tab-' + name + '-btn').classList.add('active');
   if (name === 'reports') loadHistory();
+  if (name === 'context') loadContext();
 }
 
 // ── Ask → confirm → run ─────────────────────────────────────────────────────
@@ -1255,6 +1353,34 @@ function updateSched() {
 })();
 
 setInterval(_loadHistoryData, 15000);
+
+// ── Context tab ───────────────────────────────────────────────────────────────
+function loadContext() {
+  fetch('/context').then(r => r.json()).then(d => {
+    document.getElementById('ctx-manager').value = d.manager_name || '';
+    document.getElementById('ctx-notes').value   = d.notes || '';
+  });
+}
+
+function saveContext() {
+  const btn = document.querySelector('.ctx-save');
+  const st  = document.getElementById('ctx-status');
+  btn.disabled = true;
+  fetch('/context', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      manager_name: document.getElementById('ctx-manager').value.trim(),
+      notes:        document.getElementById('ctx-notes').value,
+    })
+  }).then(r => r.json()).then(d => {
+    st.textContent = d.ok ? 'Saved.' : 'Error saving.';
+    st.style.color = d.ok ? '#3fb950' : '#f85149';
+    setTimeout(() => { st.textContent = ''; }, 3000);
+  }).catch(() => {
+    st.textContent = 'Error.'; st.style.color = '#f85149';
+    setTimeout(() => { st.textContent = ''; }, 3000);
+  }).finally(() => { btn.disabled = false; });
+}
 </script>
 </body>
 </html>
