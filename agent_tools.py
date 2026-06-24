@@ -699,7 +699,8 @@ def run_agent(question: str, agent_id: str = None, emit=None, context=None):
                 model=AGENTIC_MODEL,
                 messages=messages,
                 tools=TOOL_SCHEMAS,
-                options={"temperature": 0, "num_ctx": 16384, "think": False},
+                options={"temperature": 0, "num_ctx": 16384,
+                         "think": ag.C["AGENTIC_THINK"]},
             )
         except Exception as e:
             _emit("error", f"Model call failed: {e}")

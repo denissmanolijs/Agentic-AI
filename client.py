@@ -24,6 +24,8 @@ C = {
     "OL_HOST": os.getenv("OLLAMA_HOST",   "http://localhost:11434"),
     "AGENTIC_MODEL": os.getenv("OLLAMA_MODEL", "qwen3"),
     "AGENTIC_MAX_STEPS": int(os.getenv("AGENTIC_MAX_STEPS", "18")),
+    # Set true only for small/fast models (e.g. qwen3:8b); 14b+ becomes 9+ hrs
+    "AGENTIC_THINK": os.getenv("OLLAMA_THINK", "false").lower() == "true",
     "UI_PORT": int(os.getenv("UI_PORT", "5000")),
     "UI_HOST": os.getenv("UI_HOST", "0.0.0.0"),
     # Email delivery (all optional — leave blank to disable)
