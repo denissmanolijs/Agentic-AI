@@ -545,8 +545,7 @@ TOOL_SCHEMAS = [schema for (_fn, schema) in TOOLS.values()]
 #  THE AGENTIC LOOP
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _build_system_prompt(mgr_name=None, notes=None):
-    _mgr = mgr_name.strip() if mgr_name else ""
+def _build_system_prompt(notes=None):
     _notes = (notes or "").strip()
     _notes_section = (
         "\nENVIRONMENT CONTEXT — additional context provided by the operator:\n"
@@ -562,7 +561,6 @@ def _build_system_prompt(mgr_name=None, notes=None):
     "devices (Sophos firewall, Palo Alto, Fortinet, Cisco ASA, etc.). Nearly all "
     "alerts under agent ID 000 are events FROM those external systems — they are "
     "NOT attacks on the manager host itself.\n"
-    f"{'The manager hostname is ' + repr(_mgr) + '. ' if _mgr else ''}"
     "DETERMINING THE REAL TARGET — there are three classes of agent 000 alert:\n"
     "1. CLOUD SERVICE INTEGRATION (rule groups: office365, aws, azure, gcp, github, "
     "slack, etc.) — the event happened inside that cloud service. The Wazuh manager "
@@ -673,10 +671,12 @@ def run_agent(question: str, agent_id: str = None, emit=None, context=None):
     client = ollama.Client(host=OL_HOST)
 
     ctx = context or {}
-    system_prompt = _build_system_prompt(
-        mgr_name=ctx.get("manager_name"),
-        notes=ctx.get("notes"),
-    )
+    mgr  = (ctx.get("manager_name") or "").strip()
+    notes = (ctx.get("notes") or "").strip()
+    combined_notes = (
+        (f"Wazuh manager hostname: {mgr}\n" if mgr else "") + notes
+    ).strip()
+    system_prompt = _build_system_prompt(notes=combined_notes or None)
 
     user_msg = question
     if agent_id:
