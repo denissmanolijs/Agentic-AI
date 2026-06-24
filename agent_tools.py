@@ -699,7 +699,7 @@ def run_agent(question: str, agent_id: str = None, emit=None, context=None):
                 model=AGENTIC_MODEL,
                 messages=messages,
                 tools=TOOL_SCHEMAS,
-                options={"temperature": 0, "num_ctx": 16384},
+                options={"temperature": 0, "num_ctx": 16384, "think": False},
             )
         except Exception as e:
             _emit("error", f"Model call failed: {e}")
@@ -775,7 +775,7 @@ def run_agent(question: str, agent_id: str = None, emit=None, context=None):
     for _try in range(2):
         try:
             resp = client.chat(model=AGENTIC_MODEL, messages=messages,
-                               options={"temperature": 0, "num_predict": 1200})
+                               options={"temperature": 0, "num_predict": 2400, "think": False})
             answer = (resp.message.content or "").strip()
             if answer:
                 break
