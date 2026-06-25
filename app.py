@@ -1358,6 +1358,12 @@ function updateSched() {
 
 setInterval(_loadHistoryData, 15000);
 
+(function initRunEmail() {
+  const el = document.getElementById('run-email');
+  el.checked = localStorage.getItem('run_email') === 'true';
+  el.addEventListener('change', () => localStorage.setItem('run_email', el.checked));
+})();
+
 // ── Context tab ───────────────────────────────────────────────────────────────
 function loadContext() {
   fetch('/context').then(r => r.json()).then(d => {
