@@ -34,7 +34,7 @@ class State:
         self.sched_cfg    = {"enabled": False, "interval_hours": 8, "hours": 24, "auto_email": False, "start_time": ""}
         self.sched_wake   = threading.Event()
         self._sched_target = 0   # committed next-run unix ts; 0 = needs recompute
-        self.context_cfg  = {"manager_name": "", "notes": ""}
+        self.context_cfg  = {"notes": ""}
         self.history    = OrderedDict()
         self.hist_lock  = threading.Lock()
         _base = os.path.dirname(os.path.abspath(__file__))
@@ -910,17 +910,6 @@ input:checked+.slider:before{transform:translateX(14px)}
     </div>
 
     <div class="ctx-section">
-      <label class="ctx-label" for="ctx-manager">Wazuh Manager Hostname</label>
-      <div class="ctx-desc">
-        The hostname of the Wazuh manager node. When set, the agent knows which
-        hostname corresponds to agent ID 000 (the manager / cloud relay).
-      </div>
-      <input id="ctx-manager" class="ctx-input" type="text"
-        placeholder="e.g. wazuh-manager.internal"
-        autocomplete="off" spellcheck="false">
-    </div>
-
-    <div class="ctx-section">
       <label class="ctx-label" for="ctx-notes">Environment Notes</label>
       <div class="ctx-desc">
         Free-form context injected verbatim into the system prompt. Describe
@@ -1357,8 +1346,7 @@ setInterval(_loadHistoryData, 15000);
 // ── Context tab ───────────────────────────────────────────────────────────────
 function loadContext() {
   fetch('/context').then(r => r.json()).then(d => {
-    document.getElementById('ctx-manager').value = d.manager_name || '';
-    document.getElementById('ctx-notes').value   = d.notes || '';
+    document.getElementById('ctx-notes').value = d.notes || '';
   });
 }
 
@@ -1369,7 +1357,6 @@ function saveContext() {
   fetch('/context', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
-      manager_name: document.getElementById('ctx-manager').value.trim(),
       notes:        document.getElementById('ctx-notes').value,
     })
   }).then(r => r.json()).then(d => {

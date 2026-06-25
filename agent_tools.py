@@ -671,12 +671,7 @@ def run_agent(question: str, agent_id: str = None, emit=None, context=None):
     client = ollama.Client(host=OL_HOST)
 
     ctx = context or {}
-    mgr  = (ctx.get("manager_name") or "").strip()
-    notes = (ctx.get("notes") or "").strip()
-    combined_notes = (
-        (f"Wazuh manager hostname: {mgr}\n" if mgr else "") + notes
-    ).strip()
-    system_prompt = _build_system_prompt(notes=combined_notes or None)
+    system_prompt = _build_system_prompt(notes=(ctx.get("notes") or None))
 
     user_msg = question
     if agent_id:
