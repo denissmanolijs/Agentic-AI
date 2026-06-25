@@ -818,9 +818,14 @@ input:checked+.slider:before{transform:translateX(14px)}
         <button class="nl-btn" onclick="askConfirm()">Run now</button>
       </div>
       <div id="nl-preview"></div>
-      <div style="display:flex;gap:6px;align-items:center">
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
         <button class="btn-stop" id="stop-btn" onclick="stopRun()" disabled>Stop</button>
-        <p class="hint" style="margin:0">The agent plans its own investigation, runs Wazuh queries, and reports a verdict. This may take several minutes.</p>
+        <label class="toggle" title="Auto-send report by email when investigation completes">
+          <input type="checkbox" id="run-email">
+          <span class="slider"></span>
+        </label>
+        <span class="si">Email report on completion</span>
+        <p class="hint" style="margin:0;margin-left:4px">The agent plans its own investigation, runs Wazuh queries, and reports a verdict. This may take several minutes.</p>
       </div>
     </div>
 
@@ -1027,6 +1032,16 @@ function finish(err) {
   document.getElementById('last-run').textContent =
     'completed ' + new Date().toLocaleTimeString();
   _loadHistoryData();
+  if (!err && _curRunId && document.getElementById('run-email').checked) {
+    const bar = document.getElementById('last-run');
+    bar.textContent += ' — sending email…';
+    fetch('/email/' + _curRunId, {method: 'POST'})
+      .then(r => r.json())
+      .then(d => { bar.textContent = d.ok
+        ? 'completed ' + new Date().toLocaleTimeString() + ' — email sent ✓'
+        : 'completed — email failed: ' + (d.error || '?'); })
+      .catch(() => { bar.textContent += ' — email error'; });
+  }
 }
 
 function setRunning(on) {
