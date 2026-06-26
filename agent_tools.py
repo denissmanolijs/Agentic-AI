@@ -15,36 +15,135 @@ AGENTIC_MODEL = ag.C["AGENTIC_MODEL"]
 OL_HOST       = ag.C["OL_HOST"]
 MAX_STEPS     = ag.C["AGENTIC_MAX_STEPS"]   # safety cap on the loop
 
-_agent_cache = {}   # name/id (lower) -> id
+_agent_cache = {}        # normalised key -> numeric id string
+_agent_cache_ts  = 0.0   # unix timestamp of last full cache build
+_CACHE_TTL       = 600   # seconds before cache is considered stale
+
+
+def _build_agent_cache():
+    """Populate _agent_cache from the Wazuh API with pagination.
+    Falls back to the alerts index if the API is unavailable.
+    Stores: name (lower), id (lower), hostname (lower), hostname-without-domain."""
+    global _agent_cache_ts
+    new: dict = {}
+
+    # ── Primary: Wazuh API (/agents) ─────────────────────────────────────────
+    api_ok = False
+    try:
+        offset, page_size = 0, 500
+        while True:
+            r = ag.wget("/agents", {"limit": page_size, "offset": offset,
+                                    "select": "id,name,status,registerIP"})
+            items = r.get("affected_items", [])
+            for a in items:
+                aid  = str(a.get("id", "")).zfill(3)
+                name = (a.get("name") or "").strip()
+                if not aid or not name:
+                    continue
+                new[aid.lower()] = aid          # numeric id
+                new[name.lower()] = aid         # exact agent name
+                short = name.split(".")[0].lower()
+                if short and short not in new:
+                    new[short] = aid            # hostname without domain
+            total = r.get("total_affected_items", len(items))
+            offset += page_size
+            if offset >= total or not items:
+                break
+        api_ok = True
+        log.debug("Agent cache built from API: %d entries", len(new))
+    except Exception as e:
+        log.warning("Agent cache: Wazuh API unavailable (%s), falling back to indexer", e)
+
+    # ── Fallback: alerts index ────────────────────────────────────────────────
+    if not api_ok:
+        try:
+            page, page_size = 0, 500
+            while True:
+                agg = ag.ix_agg(
+                    {"match_all": {}},
+                    {"a": {"terms": {"field": "agent.name",
+                                     "size": page_size,
+                                     "show_term_doc_count_error": False},
+                           "aggs": {"id": {"terms": {"field": "agent.id", "size": 1}}}}})
+                buckets = agg.get("a", {}).get("buckets", [])
+                for b in buckets:
+                    idb = b.get("id", {}).get("buckets", [])
+                    if idb:
+                        aid  = str(idb[0]["key"]).zfill(3)
+                        name = b["key"]
+                        new[aid.lower()] = aid
+                        new[name.lower()] = aid
+                        short = name.split(".")[0].lower()
+                        if short and short not in new:
+                            new[short] = aid
+                if len(buckets) < page_size:
+                    break
+                page += 1
+                if page > 9:     # hard cap: 5000 agents via indexer
+                    break
+            log.debug("Agent cache built from indexer: %d entries", len(new))
+        except Exception as e:
+            log.warning("Agent cache: indexer fallback also failed (%s)", e)
+
+    _agent_cache.clear()
+    _agent_cache.update(new)
+    _agent_cache_ts = time.time()
+
 
 def _resolve_agent(agent_id):
-    """Accept an agent name or ID; return the real numeric ID string.
-    Falls back to the input (zfilled) if nothing matches."""
+    """Resolve an agent name/ID to a zero-padded numeric ID string.
+
+    Accepts: numeric ID, agent name, hostname, FQDN, or partial hostname
+    (only if the partial matches exactly one agent).
+    Returns None if the agent cannot be found — callers must handle this.
+    Logs resolution decisions for troubleshooting.
+    """
     if not agent_id:
         return None
-    key = str(agent_id).strip().lower()
+    raw = str(agent_id).strip()
+    key = raw.lower()
 
+    # Numeric ID — no lookup needed
     if key.isdigit():
-        return key.zfill(3)
+        resolved = key.zfill(3)
+        log.debug("Resolve %r → %s (numeric, no lookup)", raw, resolved)
+        return resolved
 
-    if key in _agent_cache:
-        return _agent_cache[key]
+    def _lookup(k):
+        """Try exact key, then hostname-without-domain."""
+        if k in _agent_cache:
+            return _agent_cache[k]
+        short = k.split(".")[0]
+        if short != k and short in _agent_cache:
+            return _agent_cache[short]
+        # Partial prefix match — only when exactly one agent matches
+        matches = [v for ck, v in _agent_cache.items()
+                   if ck.startswith(k) and not ck.isdigit()]
+        unique = list(dict.fromkeys(matches))   # deduplicate preserving order
+        if len(unique) == 1:
+            return unique[0]
+        return None
 
-    # Build the map from the indexer (no Wazuh API dependency)
-    try:
-        agg = ag.ix_agg({"match_all": {}},
-                        {"a": {"terms": {"field": "agent.name", "size": 50},
-                               "aggs": {"id": {"terms": {"field": "agent.id", "size": 1}}}}})
-        for b in agg.get("a", {}).get("buckets", []):
-            idb = b.get("id", {}).get("buckets", [])
-            if idb:
-                aid = idb[0]["key"]
-                _agent_cache[b["key"].lower()] = aid
-                _agent_cache[aid.lower()]      = aid
-    except Exception:
-        pass
+    # ── Try cache (refresh if stale) ─────────────────────────────────────────
+    cache_age = time.time() - _agent_cache_ts
+    if cache_age > _CACHE_TTL or not _agent_cache:
+        _build_agent_cache()
 
-    return _agent_cache.get(key, str(agent_id).zfill(3))
+    result = _lookup(key)
+    if result:
+        log.debug("Resolve %r → %s (cache hit)", raw, result)
+        return result
+
+    # ── Cache miss — force one refresh and retry ──────────────────────────────
+    log.debug("Resolve %r: cache miss, refreshing", raw)
+    _build_agent_cache()
+    result = _lookup(key)
+    if result:
+        log.debug("Resolve %r → %s (after refresh)", raw, result)
+        return result
+
+    log.warning("Resolution failed for %r — not found in Wazuh API or indexer", raw)
+    return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -57,7 +156,11 @@ def _tool_search_alerts(query: str = "", hours: int = 24, agent_id: str = None,
     since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     must  = [{"range": {"timestamp": {"gte": since}}}]
     if agent_id:
-        must.append({"term": {"agent.id": _resolve_agent(agent_id)}})
+        aid = _resolve_agent(agent_id)
+        if aid is None:
+            return {"error": f"Agent '{agent_id}' could not be resolved. "
+                             "Call list_agents() to see available agents."}
+        must.append({"term": {"agent.id": aid}})
     if min_level:
         must.append({"range": {"rule.level": {"gte": min_level}}})
     q_low  = (query or "").lower().strip()
@@ -106,7 +209,11 @@ def _tool_aggregate_alerts(group_by: str = "rule.groups", hours: int = 24,
     since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     must  = [{"range": {"timestamp": {"gte": since}}}]
     if agent_id:
-        must.append({"term": {"agent.id": _resolve_agent(agent_id)}})
+        aid = _resolve_agent(agent_id)
+        if aid is None:
+            return {"error": f"Agent '{agent_id}' could not be resolved. "
+                             "Call list_agents() to see available agents."}
+        must.append({"term": {"agent.id": aid}})
     if min_level:
         must.append({"range": {"rule.level": {"gte": min_level}}})
     bq = {"bool": {"must": must}}
@@ -130,9 +237,13 @@ def _tool_get_agent_timeline(agent_id: str, hours: int = 6, min_level: int = 0):
     """Chronological event timeline for one agent — for chain reconstruction."""
     if not agent_id:
         return {"error": "agent_id is required"}
+    aid = _resolve_agent(agent_id)
+    if aid is None:
+        return {"error": f"Agent '{agent_id}' could not be resolved. "
+                         "Call list_agents() to see available agents."}
     since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     must  = [{"range": {"timestamp": {"gte": since}}},
-             {"term": {"agent.id": _resolve_agent(agent_id)}}]
+             {"term": {"agent.id": aid}}]
     if min_level:
         must.append({"range": {"rule.level": {"gte": min_level}}})
     hits = ag.ix_search({"bool": {"must": must}}, size=40,
@@ -154,7 +265,11 @@ def _tool_get_inventory(kind: str, agent_id: str):
      """
     if kind not in ("packages", "ports", "processes", "files"):
         return {"error": f"kind must be packages/ports/processes/files, got {kind}"}
-    res = ag.inventory(kind, _resolve_agent(agent_id))
+    aid = _resolve_agent(agent_id)
+    if aid is None:
+        return {"error": f"Agent '{agent_id}' could not be resolved. "
+                         "Call list_agents() to see available agents."}
+    res = ag.inventory(kind, aid)
     # inventory() already returns raw facts only — no judgment to strip.
     # Cap rows so a large host doesn't flood the model's context.
     rows = res.get("rows", [])
@@ -177,6 +292,9 @@ def _tool_get_event_sequence(agent_id: str, around_time: str = None,
                             window_minutes: int = 30, min_level: int = 0):
 
     aid = _resolve_agent(agent_id)
+    if aid is None:
+        return {"error": f"Agent '{agent_id}' could not be resolved. "
+                         "Call list_agents() to see available agents."}
     # Resolve the window. If a time is given, center on it; else last N minutes.
     try:
         if around_time:
@@ -283,7 +401,11 @@ def _tool_get_vulnerabilities(agent_id: str = None, days: int = 30):
     must = [{"range": {"timestamp": {"gte": since}}},
             {"match": {"rule.groups": "vulnerability-detector"}}]
     if agent_id:
-        must.append({"term": {"agent.id": _resolve_agent(agent_id)}})
+        aid = _resolve_agent(agent_id)
+        if aid is None:
+            return {"error": f"Agent '{agent_id}' could not be resolved. "
+                             "Call list_agents() to see available agents."}
+        must.append({"term": {"agent.id": aid}})
     q = {"bool": {"must": must}}
     agg = ag.ix_agg(q, {
         "total":  {"value_count": {"field": "rule.level"}},
@@ -321,16 +443,23 @@ def _tool_get_active_agents(hours: int = 168):
 
 
 def _tool_list_agents():
-    """List enrolled agents and their status."""
+    """List enrolled agents and their status (paginated, supports large environments)."""
     try:
-        r = ag.wget("/agents", {"limit": 100,
-                                "select": "id,name,status,os.platform,ip"})
-        items = r.get("affected_items", [])
-        return {"count": len(items),
+        agents, offset, page_size = [], 0, 500
+        while True:
+            r = ag.wget("/agents", {"limit": page_size, "offset": offset,
+                                    "select": "id,name,status,os.platform,ip"})
+            items = r.get("affected_items", [])
+            agents.extend(items)
+            total = r.get("total_affected_items", len(items))
+            offset += page_size
+            if offset >= total or not items:
+                break
+        return {"count": len(agents),
                 "agents": [{"id": a.get("id"), "name": a.get("name"),
                             "status": a.get("status"),
                             "os": (a.get("os", {}) or {}).get("platform", "?"),
-                            "ip": a.get("ip")} for a in items]}
+                            "ip": a.get("ip")} for a in agents]}
     except Exception as e:
         return {"error": str(e)}
 
@@ -580,7 +709,12 @@ def _build_system_prompt(notes=None):
     "password-spray, brute-force, or connection alerts from a firewall integration, "
     "read the destination IP from the alert data to name the actual victim host.\n"
     + _notes_section +
-    "\nWork iteratively: decide which tool to call, read the result, then decide if "
+    "\nAGENT RESOLUTION — if any tool returns an error containing 'could not be "
+    "resolved', do NOT give up. First call list_agents() to get the full list of "
+    "enrolled agents, identify the closest match by name or hostname, then retry "
+    "the original tool call with the correct name or ID. Only conclude a host does "
+    "not exist after you have checked list_agents() and confirmed no match.\n\n"
+    "Work iteratively: decide which tool to call, read the result, then decide if "
     "you need more data or can conclude. Prefer starting broad (aggregate or "
     "search) then drilling into specific agents and timelines.\n\n"
     "TIME WINDOWS — critical: if the user gives no timeframe, default to a BROAD "
@@ -633,7 +767,6 @@ def _build_system_prompt(notes=None):
     "numbers your tools returned. Plain text, no markdown headers."
 )
 
-SYSTEM_PROMPT = _build_system_prompt()
 
 
 def run_agent(question: str, agent_id: str = None, emit=None, context=None):
@@ -645,8 +778,7 @@ def run_agent(question: str, agent_id: str = None, emit=None, context=None):
     emit     : optional callback(event_type, payload) for streaming to a UI.
                event_type is one of: 'thinking', 'tool_call', 'tool_result',
                'answer', 'done', 'error'. If None, prints to stdout.
-    context  : optional dict with keys 'manager_name' and 'notes' from the
-               Context tab; overrides WAZUH_MANAGER_NAME from .env.
+    context  : optional dict with key 'notes' from the Context tab.
 
     Returns the final answer string.
     """
