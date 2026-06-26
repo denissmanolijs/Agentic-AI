@@ -523,7 +523,14 @@ def set_context():
 
 @app.route("/status")
 def status():
+    current_run_id = None
+    with ST.hist_lock:
+        for item in reversed(list(ST.history.values())):
+            if item.get("status") == "running":
+                current_run_id = item["id"]
+                break
     return jsonify({"running": ST.lock.locked(), "model": AGENTIC_MODEL,
+                    "current_run_id": current_run_id,
                     "schedule": {**ST.sched_cfg, "next_run": _fmt_next_run(ST.sched_cfg)}})
 
 
@@ -1357,6 +1364,35 @@ function updateSched() {
 })();
 
 setInterval(_loadHistoryData, 15000);
+
+(function initRunState() {
+  fetch('/status').then(r => r.json()).then(d => {
+    if (!d.running) return;
+    _running    = true;
+    _curRunId   = d.current_run_id || null;
+    setRunning(true);
+    document.getElementById('live-title').textContent = 'Investigating';
+    document.getElementById('dot').className = 'live-dot running';
+    document.getElementById('live-out').textContent =
+      '(Page was refreshed while an investigation was running.\n' +
+      'The investigation is continuing in the background — waiting for it to finish…)';
+    _t0 = Date.now();
+    _timer = setInterval(() => {
+      document.getElementById('elapsed').textContent =
+        Math.floor((Date.now() - _t0) / 1000) + 's';
+    }, 1000);
+    // Poll every 4s until the run shows completed in history
+    const poll = setInterval(() => {
+      if (!_curRunId) { clearInterval(poll); return; }
+      fetch('/history/' + _curRunId).then(r => r.json()).then(item => {
+        if (item.status && item.status !== 'running') {
+          clearInterval(poll);
+          finish(false);
+        }
+      }).catch(() => {});
+    }, 4000);
+  });
+})();
 
 (function initRunEmail() {
   const el = document.getElementById('run-email');
