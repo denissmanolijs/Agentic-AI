@@ -395,7 +395,7 @@ def _tool_find_entity_across_agents(entity: str, hours: int = 168):
             "per_agent": agents}
 
 
-def _tool_get_vulnerabilities(agent_id: str = None, days: int = 30):
+def _tool_get_vulnerabilities(agent_id: str = None, cve: str = None, days: int = 30):
 
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     must = [{"range": {"timestamp": {"gte": since}}},
@@ -406,6 +406,8 @@ def _tool_get_vulnerabilities(agent_id: str = None, days: int = 30):
             return {"error": f"Agent '{agent_id}' could not be resolved. "
                              "Call list_agents() to see available agents."}
         must.append({"term": {"agent.id": aid}})
+    if cve:
+        must.append({"match_phrase": {"rule.description": cve.upper()}})
     q = {"bool": {"must": must}}
     agg = ag.ix_agg(q, {
         "total":  {"value_count": {"field": "rule.level"}},
@@ -419,7 +421,8 @@ def _tool_get_vulnerabilities(agent_id: str = None, days: int = 30):
         cves.append({"description": b["key"], "count": b["doc_count"],
                      "max_level": b.get("mx", {}).get("value") or 0,
                      "agents": [x["key"] for x in b.get("agents", {}).get("buckets", [])]})
-    return {"window_days": days, "scope": agent_id or "all agents",
+    scope = " | ".join(filter(None, [agent_id, cve])) or "all agents"
+    return {"window_days": days, "scope": scope,
             "total_findings": agg.get("total", {}).get("value", 0),
             "vulnerabilities": cves}
 
@@ -625,14 +628,18 @@ TOOLS = {
             "name": "get_vulnerabilities",
             "description": "List detected CVE vulnerabilities from Wazuh's "
                            "vulnerability-detector (read from the indexer, always "
-                           "available). Optionally scope to one agent. Use this for "
-                           "any question about vulnerabilities, CVEs, or patch gaps. "
+                           "available). Optionally scope to one agent and/or one CVE "
+                           "ID. Use this for any question about vulnerabilities, CVEs, "
+                           "or patch gaps. To look up a specific CVE pass it as cve=. "
                            "Returns CVE descriptions, severities, and affected hosts.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "agent_id": {"type": "string",
-                                 "description": "Optional — scope to one agent"},
+                                 "description": "Optional — scope to one agent (name or ID)"},
+                    "cve":      {"type": "string",
+                                 "description": "Optional — filter to a specific CVE ID, "
+                                                "e.g. 'CVE-2026-44815'"},
                     "days":     {"type": "integer", "description": "Window (default 30)"},
                 },
             },
