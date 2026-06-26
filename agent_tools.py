@@ -407,7 +407,14 @@ def _tool_get_vulnerabilities(agent_id: str = None, cve: str = None, days: int =
                              "Call list_agents() to see available agents."}
         must.append({"term": {"agent.id": aid}})
     if cve:
-        must.append({"match_phrase": {"rule.description": cve.upper()}})
+        cve_upper = cve.upper()
+        # rule.description is a keyword field in OpenSearch — match_phrase won't work.
+        # Use the dedicated data.vulnerability.cve field first; wildcard on .keyword as fallback.
+        must.append({"bool": {"should": [
+            {"term":     {"data.vulnerability.cve":         cve_upper}},
+            {"wildcard": {"rule.description.keyword":       f"*{cve_upper}*"}},
+            {"match_phrase": {"rule.description":           cve_upper}},
+        ], "minimum_should_match": 1}})
     q = {"bool": {"must": must}}
     agg = ag.ix_agg(q, {
         "total":  {"value_count": {"field": "rule.level"}},
