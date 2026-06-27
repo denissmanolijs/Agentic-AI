@@ -157,9 +157,11 @@ def _resolve_agent(agent_id):
     # Handles agents that appear in the API but were somehow missed by the bulk
     # cache build (e.g., pagination edge case, API returned 0 on first rebuild).
     try:
-        r = ag.wget("/agents", {"q": f"name={raw}",
+        # Use search= (case-insensitive full-text) rather than q=name= (case-sensitive exact).
+        # The result check below filters to exact name match after lowercasing.
+        r = ag.wget("/agents", {"search": key,
                                 "select": "id,name",
-                                "limit": 5,
+                                "limit": 10,
                                 "status": "active,disconnected,never_connected,pending"})
         for a in r.get("affected_items", []):
             if (a.get("name") or "").lower() == key:
