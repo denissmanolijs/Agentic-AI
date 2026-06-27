@@ -195,7 +195,7 @@ def _tool_search_alerts(query: str = "", hours: int = 24, agent_id: str = None,
         aid = _resolve_agent(agent_id)
         if aid is None:
             return {"error": f"Agent '{agent_id}' could not be resolved. "
-                             "Call list_agents() to see available agents."}
+                             "Call list_agents(name=<partial>) to search for the agent."}
         must.append({"term": {"agent.id": aid}})
     if min_level:
         must.append({"range": {"rule.level": {"gte": min_level}}})
@@ -248,7 +248,7 @@ def _tool_aggregate_alerts(group_by: str = "rule.groups", hours: int = 24,
         aid = _resolve_agent(agent_id)
         if aid is None:
             return {"error": f"Agent '{agent_id}' could not be resolved. "
-                             "Call list_agents() to see available agents."}
+                             "Call list_agents(name=<partial>) to search for the agent."}
         must.append({"term": {"agent.id": aid}})
     if min_level:
         must.append({"range": {"rule.level": {"gte": min_level}}})
@@ -276,7 +276,7 @@ def _tool_get_agent_timeline(agent_id: str, hours: int = 6, min_level: int = 0):
     aid = _resolve_agent(agent_id)
     if aid is None:
         return {"error": f"Agent '{agent_id}' could not be resolved. "
-                         "Call list_agents() to see available agents."}
+                         "Call list_agents(name=<partial>) to search for the agent."}
     since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     must  = [{"range": {"timestamp": {"gte": since}}},
              {"term": {"agent.id": aid}}]
@@ -304,7 +304,7 @@ def _tool_get_inventory(kind: str, agent_id: str):
     aid = _resolve_agent(agent_id)
     if aid is None:
         return {"error": f"Agent '{agent_id}' could not be resolved. "
-                         "Call list_agents() to see available agents."}
+                         "Call list_agents(name=<partial>) to search for the agent."}
     res = ag.inventory(kind, aid)
     # inventory() already returns raw facts only — no judgment to strip.
     # Cap rows so a large host doesn't flood the model's context.
@@ -330,7 +330,7 @@ def _tool_get_event_sequence(agent_id: str, around_time: str = None,
     aid = _resolve_agent(agent_id)
     if aid is None:
         return {"error": f"Agent '{agent_id}' could not be resolved. "
-                         "Call list_agents() to see available agents."}
+                         "Call list_agents(name=<partial>) to search for the agent."}
     # Resolve the window. If a time is given, center on it; else last N minutes.
     try:
         if around_time:
@@ -440,7 +440,7 @@ def _tool_get_vulnerabilities(agent_id: str = None, cve: str = None, days: int =
         aid = _resolve_agent(agent_id)
         if aid is None:
             return {"error": f"Agent '{agent_id}' could not be resolved. "
-                             "Call list_agents() to see available agents."}
+                             "Call list_agents(name=<partial>) to search for the agent."}
         must.append({"term": {"agent.id": aid}})
     if cve:
         cve_upper = cve.upper()
@@ -488,19 +488,22 @@ def _tool_get_active_agents(hours: int = 168):
     return {"window_hours": hours, "active_agents": out}
 
 
-def _tool_list_agents():
-    """List enrolled agents and their status (paginated, supports large environments)."""
+def _tool_list_agents(name: str = None):
+    """List enrolled agents. Pass name to filter by partial name/hostname."""
     try:
-        agents, offset, page_size = [], 0, 500
+        params = {"limit": 500, "offset": 0,
+                  "select": "id,name,status,os.platform,ip",
+                  "status": ["active", "disconnected", "never_connected", "pending"]}
+        if name:
+            params["search"] = name.lower()
+        agents, offset = [], 0
         while True:
-            r = ag.wget("/agents", {"limit": page_size, "offset": offset,
-                                    "select": "id,name,status,os.platform,ip",
-                                    "status": ["active", "disconnected",
-                                               "never_connected", "pending"]})
+            params["offset"] = offset
+            r = ag.wget("/agents", params)
             items = r.get("affected_items", [])
             agents.extend(items)
             total = r.get("total_affected_items", len(items))
-            offset += page_size
+            offset += 500
             if offset >= total or not items:
                 break
         return {"count": len(agents),
@@ -712,9 +715,18 @@ TOOLS = {
         "type": "function",
         "function": {
             "name": "list_agents",
-            "description": "List all enrolled agents with their status, OS, and IP. "
-                           "Use this when you need to know which hosts exist.",
-            "parameters": {"type": "object", "properties": {}},
+            "description": "List enrolled Wazuh agents with their ID, status, OS, and IP. "
+                           "Pass name= to filter by partial name or hostname — always prefer "
+                           "this over fetching the full list when you are looking for a "
+                           "specific host. Without name= returns all agents (257+).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string",
+                             "description": "Optional partial name/hostname to filter by, "
+                                            "e.g. 'Node' returns Node1, Node2, etc."},
+                },
+            },
         },
     }),
 }
@@ -762,10 +774,11 @@ def _build_system_prompt(notes=None):
     "read the destination IP from the alert data to name the actual victim host.\n"
     + _notes_section +
     "\nAGENT RESOLUTION — if any tool returns an error containing 'could not be "
-    "resolved', do NOT give up. First call list_agents() to get the full list of "
-    "enrolled agents, identify the closest match by name or hostname, then retry "
-    "the original tool call with the correct name or ID. Only conclude a host does "
-    "not exist after you have checked list_agents() and confirmed no match.\n\n"
+    "resolved', do NOT give up. Call list_agents(name=<partial>) with the partial "
+    "name you are looking for (e.g. list_agents(name='Node') to find Node1, Node2). "
+    "Identify the correct name or ID from the result, then retry the original tool "
+    "call. Only conclude a host does not exist after list_agents(name=…) returns "
+    "zero matches.\n\n"
     "Work iteratively: decide which tool to call, read the result, then decide if "
     "you need more data or can conclude. Prefer starting broad (aggregate or "
     "search) then drilling into specific agents and timelines.\n\n"
