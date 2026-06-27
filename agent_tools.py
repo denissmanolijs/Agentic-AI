@@ -91,8 +91,13 @@ def _build_agent_cache():
         except Exception as e:
             log.warning("Agent cache: indexer fallback also failed (%s)", e)
 
-    _agent_cache.clear()
-    _agent_cache.update(new)
+    if new:
+        # Only replace the cache if we got results — a failed rebuild (API down +
+        # indexer down) must not wipe valid entries that were already there.
+        _agent_cache.clear()
+        _agent_cache.update(new)
+    else:
+        log.warning("Agent cache rebuild returned no agents — keeping existing entries")
     _agent_cache_ts = time.time()
 
 
@@ -147,6 +152,26 @@ def _resolve_agent(agent_id):
     if result:
         log.debug("Resolve %r → %s (after refresh)", raw, result)
         return result
+
+    # ── Last resort: targeted single-agent API lookup ─────────────────────────
+    # Handles agents that appear in the API but were somehow missed by the bulk
+    # cache build (e.g., pagination edge case, API returned 0 on first rebuild).
+    try:
+        r = ag.wget("/agents", {"q": f"name={raw}",
+                                "select": "id,name",
+                                "limit": 5,
+                                "status": "active,disconnected,never_connected,pending"})
+        for a in r.get("affected_items", []):
+            if (a.get("name") or "").lower() == key:
+                aid = str(a.get("id", "")).zfill(3)
+                if aid and aid != "000":
+                    # Warm the cache so the next call doesn't need this path
+                    _agent_cache[key] = aid
+                    _agent_cache[aid.lower()] = aid
+                    log.debug("Resolve %r → %s (targeted API lookup)", raw, aid)
+                    return aid
+    except Exception as e:
+        log.debug("Targeted API lookup for %r failed: %s", raw, e)
 
     log.warning("Resolution failed for %r — not found in Wazuh API or indexer", raw)
     return None
