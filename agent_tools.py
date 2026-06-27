@@ -33,7 +33,10 @@ def _build_agent_cache():
         offset, page_size = 0, 500
         while True:
             r = ag.wget("/agents", {"limit": page_size, "offset": offset,
-                                    "select": "id,name,status,registerIP"})
+                                    "select": "id,name,status,registerIP",
+                                    # Include ALL agent states — disconnected/never_connected
+                                    # agents are excluded by some Wazuh default configs.
+                                    "status": "active,disconnected,never_connected,pending"})
             items = r.get("affected_items", [])
             for a in items:
                 aid  = str(a.get("id", "")).zfill(3)
@@ -49,7 +52,10 @@ def _build_agent_cache():
             offset += page_size
             if offset >= total or not items:
                 break
-        api_ok = True
+        # Only mark API as OK if it actually returned agents.
+        # wget() silently converts 400/404 into empty affected_items — if we got
+        # zero agents the endpoint probably errored; fall through to the indexer.
+        api_ok = bool(new)
         log.debug("Agent cache built from API: %d entries", len(new))
     except Exception as e:
         log.warning("Agent cache: Wazuh API unavailable (%s), falling back to indexer", e)
