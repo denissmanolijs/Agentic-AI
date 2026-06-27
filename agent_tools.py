@@ -34,9 +34,11 @@ def _build_agent_cache():
         while True:
             r = ag.wget("/agents", {"limit": page_size, "offset": offset,
                                     "select": "id,name,status,registerIP",
-                                    # Include ALL agent states — disconnected/never_connected
-                                    # agents are excluded by some Wazuh default configs.
-                                    "status": "active,disconnected,never_connected,pending"})
+                                    # Pass status as a list so requests sends repeated params
+                                    # (?status=active&status=disconnected&...) instead of a
+                                    # comma-joined string, which Wazuh silently ignores.
+                                    "status": ["active", "disconnected",
+                                               "never_connected", "pending"]})
             items = r.get("affected_items", [])
             for a in items:
                 aid  = str(a.get("id", "")).zfill(3)
@@ -162,7 +164,8 @@ def _resolve_agent(agent_id):
         r = ag.wget("/agents", {"search": key,
                                 "select": "id,name",
                                 "limit": 10,
-                                "status": "active,disconnected,never_connected,pending"})
+                                "status": ["active", "disconnected",
+                                           "never_connected", "pending"]})
         for a in r.get("affected_items", []):
             if (a.get("name") or "").lower() == key:
                 aid = str(a.get("id", "")).zfill(3)
@@ -491,7 +494,9 @@ def _tool_list_agents():
         agents, offset, page_size = [], 0, 500
         while True:
             r = ag.wget("/agents", {"limit": page_size, "offset": offset,
-                                    "select": "id,name,status,os.platform,ip"})
+                                    "select": "id,name,status,os.platform,ip",
+                                    "status": ["active", "disconnected",
+                                               "never_connected", "pending"]})
             items = r.get("affected_items", [])
             agents.extend(items)
             total = r.get("total_affected_items", len(items))
