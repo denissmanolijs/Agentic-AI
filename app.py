@@ -137,49 +137,49 @@ def _run_agentic(question, run_id, q=None):
             if q is not None:
                 q.put(line)
 
-    final = ""
+    # Outer try/finally ensures the lock is released after ALL work is done —
+    # history saved, structured report generated, and __DONE__ queued.
+    # The lock must NOT be released in generate()'s finally (SSE generator)
+    # because that fires when the client disconnects, not when work finishes.
     try:
-        final = agent.run_agent(question, emit=emit, context=ST.context_cfg)
-    except Exception as e:
-        log.exception("Agentic run failed")
+        final = ""
+        try:
+            final = agent.run_agent(question, emit=emit, context=ST.context_cfg)
+        except Exception as e:
+            log.exception("Agentic run failed")
+            if q is not None:
+                q.put(f"\n[error] {e}\n")
+            final = f"[error: {e}]"
+
+        # Compose the saved report: the verdict, then the audit trail.
+        audit_text = "\n".join(
+            f"{i+1}. {a['tool']}({json.dumps(a['args'])})" for i, a in enumerate(audit)
+        ) or "(no tool calls recorded)"
+        report = (f"QUESTION: {question}\n\n{final}\n\n"
+                  f"{'─'*50}\nTOOL-CALL AUDIT TRAIL ({len(audit)} calls)\n{'─'*50}\n"
+                  f"{audit_text}")
+
+        # Generate structured JSON report (second LLM pass; skipped if run was stopped)
+        structured = None
+        if not ag.STOP_FLAG.is_set():
+            structured = _generate_structured(question, final, audit)
+
+        with ST.hist_lock:
+            if run_id in ST.history:
+                ST.history[run_id]["status"] = ("stopped" if ag.STOP_FLAG.is_set()
+                                                else "completed")
+                ST.history[run_id]["report"]     = report
+                ST.history[run_id]["structured"] = structured
+                ST.history[run_id]["ended"]      = datetime.now().strftime("%H:%M")
+            while len(ST.history) > 50:
+                ST.history.popitem(last=False)
+            ST._save_history()
+
         if q is not None:
-            q.put(f"\n[error] {e}\n")
-        final = f"[error: {e}]"
+            q.put("__DONE__")
+        return report
     finally:
-        # Release the investigation lock here — not in the SSE generator.
-        # The generator's finally runs when the *client* disconnects (e.g. page
-        # refresh), which is earlier than when the investigation actually ends.
-        # Releasing here ensures /status reports running=true for the full
-        # duration regardless of whether the browser is still connected.
         ST.lock.release()
-
-    # Compose the saved report: the verdict, then the audit trail.
-    audit_text = "\n".join(
-        f"{i+1}. {a['tool']}({json.dumps(a['args'])})" for i, a in enumerate(audit)
-    ) or "(no tool calls recorded)"
-    report = (f"QUESTION: {question}\n\n{final}\n\n"
-              f"{'─'*50}\nTOOL-CALL AUDIT TRAIL ({len(audit)} calls)\n{'─'*50}\n"
-              f"{audit_text}")
-
-    # Generate structured JSON report (second LLM pass; skipped if run was stopped)
-    structured = None
-    if not ag.STOP_FLAG.is_set():
-        structured = _generate_structured(question, final, audit)
-
-    with ST.hist_lock:
-        if run_id in ST.history:
-            ST.history[run_id]["status"] = ("stopped" if ag.STOP_FLAG.is_set()
-                                            else "completed")
-            ST.history[run_id]["report"]     = report
-            ST.history[run_id]["structured"] = structured
-            ST.history[run_id]["ended"]      = datetime.now().strftime("%H:%M")
-        while len(ST.history) > 50:
-            ST.history.popitem(last=False)
-        ST._save_history()
-
-    if q is not None:
-        q.put("__DONE__")
-    return report
 
 
 # ── Structured report generation ──────────────────────────────────────────────
@@ -1048,10 +1048,17 @@ function finish(err) {
   document.getElementById('last-run').textContent =
     'completed ' + new Date().toLocaleTimeString();
   _loadHistoryData();
-  if (!err && _curRunId && document.getElementById('run-email').checked) {
+  // Capture and clear _curRunId atomically — prevents double-send if finish()
+  // is called twice (once from onerror, once from onmessage with __DONE__).
+  const finishedRunId = _curRunId;
+  _curRunId = null;
+  if (finishedRunId && document.getElementById('run-email').checked) {
+    // Do not gate on !err: SSE errors (connection drop, keepalive timeout) fire
+    // onerror even when the investigation completed successfully. The backend
+    // returns 409 if the run is still in progress, so no partial emails are sent.
     const bar = document.getElementById('last-run');
     bar.textContent += ' — sending email…';
-    fetch('/email/' + _curRunId, {method: 'POST'})
+    fetch('/email/' + finishedRunId, {method: 'POST'})
       .then(r => r.json())
       .then(d => { bar.textContent = d.ok
         ? 'completed ' + new Date().toLocaleTimeString() + ' — email sent ✓'
