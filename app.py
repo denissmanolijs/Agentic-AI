@@ -145,6 +145,13 @@ def _run_agentic(question, run_id, q=None):
         if q is not None:
             q.put(f"\n[error] {e}\n")
         final = f"[error: {e}]"
+    finally:
+        # Release the investigation lock here — not in the SSE generator.
+        # The generator's finally runs when the *client* disconnects (e.g. page
+        # refresh), which is earlier than when the investigation actually ends.
+        # Releasing here ensures /status reports running=true for the full
+        # duration regardless of whether the browser is still connected.
+        ST.lock.release()
 
     # Compose the saved report: the verdict, then the audit trail.
     audit_text = "\n".join(
@@ -402,23 +409,19 @@ def agent_stream():
                      daemon=True).start()
 
     def generate():
-        try:
-            # Send the run_id first so the client can link to the report.
-            yield f"data: __RUNID__{run_id}\n\n"
-            while True:
-                try:
-                    chunk = q.get(timeout=30)
-                except queue.Empty:
-                    yield ": keepalive\n\n"
-                    continue
-                if chunk == "__DONE__":
-                    yield "data: __DONE__\n\n"
-                    break
-                for line in chunk.splitlines(keepends=True):
-                    yield f"data: {line}\n\n"
-        finally:
-            ST.lock.release()
-
+        # Send the run_id first so the client can link to the report.
+        yield f"data: __RUNID__{run_id}\n\n"
+        while True:
+            try:
+                chunk = q.get(timeout=30)
+            except queue.Empty:
+                yield ": keepalive\n\n"
+                continue
+            if chunk == "__DONE__":
+                yield "data: __DONE__\n\n"
+                break
+            for line in chunk.splitlines(keepends=True):
+                yield f"data: {line}\n\n"
     return Response(generate(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache",
                              "X-Accel-Buffering": "no"})
