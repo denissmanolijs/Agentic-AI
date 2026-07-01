@@ -1,4 +1,4 @@
-import os, sys, json, queue, threading, time, logging, argparse
+import os, sys, json, queue, threading, time, logging, logging.handlers, argparse
 import html as _html
 import smtplib
 from email.mime.multipart import MIMEMultipart
@@ -17,8 +17,14 @@ import agent_tools as agent   # the agentic tool-calling loop
 
 app  = Flask(__name__)
 CORS(app)
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s  %(levelname)s  %(message)s")
+_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent.log")
+_log_fmt  = logging.Formatter("%(asctime)s  %(levelname)s  %(message)s")
+_sh = logging.StreamHandler(sys.stdout)
+_sh.setFormatter(_log_fmt)
+_fh = logging.handlers.RotatingFileHandler(
+    _LOG_FILE, maxBytes=5*1024*1024, backupCount=3, encoding="utf-8")
+_fh.setFormatter(_log_fmt)
+logging.basicConfig(level=logging.INFO, handlers=[_sh, _fh])
 log = logging.getLogger("app")
 
 AGENTIC_MODEL = ag.C["AGENTIC_MODEL"]
