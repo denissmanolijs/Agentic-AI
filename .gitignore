@@ -12,3 +12,4 @@ agent.log
 agent.log.*
 client.log
 *.cache
+/log/
