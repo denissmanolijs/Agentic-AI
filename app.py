@@ -600,17 +600,15 @@ def _scheduler():
                     "started": datetime.now().strftime("%Y-%m-%d %H:%M"),
                     "ended": None, "status": "running", "report": "",
                 }
-            try:
-                _run_agentic(question, run_id, q=None)
-                if cfg.get("auto_email"):
-                    with ST.hist_lock:
-                        item = ST.history.get(run_id)
-                    if item:
-                        ok, err = _send_email(item)
-                        if not ok:
-                            log.warning("Auto-email failed for %s: %s", run_id, err)
-            finally:
-                ST.lock.release()
+            # _run_agentic() always releases ST.lock in its own finally — do not release here
+            _run_agentic(question, run_id, q=None)
+            if cfg.get("auto_email"):
+                with ST.hist_lock:
+                    item = ST.history.get(run_id)
+                if item:
+                    ok, err = _send_email(item)
+                    if not ok:
+                        log.warning("Auto-email failed for %s: %s", run_id, err)
 
 
 # ── Page ──────────────────────────────────────────────────────────────────────
