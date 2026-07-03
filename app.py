@@ -1050,7 +1050,10 @@ function finish(err) {
   // is called twice (once from onerror, once from onmessage with __DONE__).
   const finishedRunId = _curRunId;
   _curRunId = null;
-  if (finishedRunId && document.getElementById('run-email').checked) {
+  // Skip frontend email for scheduled runs — the scheduler backend sends its own
+  // email via auto_email; sending here too would produce a duplicate.
+  const isScheduled = finishedRunId && finishedRunId.startsWith('sched_');
+  if (finishedRunId && !isScheduled && document.getElementById('run-email').checked) {
     // Do not gate on !err: SSE errors (connection drop, keepalive timeout) fire
     // onerror even when the investigation completed successfully. The backend
     // returns 409 if the run is still in progress, so no partial emails are sent.
