@@ -524,8 +524,14 @@ TOOLS = {
             "description": "Search security alerts. query is OPTIONAL — omit it (or "
                            "pass empty) to match ALL alerts and filter only by "
                            "hours/agent_id/min_level (e.g. 'all severity-12 events'). "
-                           "Provide a keyword/phrase/IP/hash to narrow. Returns "
-                           "match count, max severity, and sample events.",
+                           "Provide a keyword/phrase/IP/hash to narrow. LITERAL "
+                           "substring match, not semantic: a multi-word query "
+                           "requires ALL words to appear in the same field, so a "
+                           "wrong wording guess returns zero matches even when "
+                           "matching alerts exist. For brute-force/failed-login "
+                           "questions, call aggregate_alerts(group_by='rule.groups') "
+                           "first to find the real group name instead of guessing "
+                           "text. Returns match count, max severity, and sample events.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -549,7 +555,12 @@ TOOLS = {
             "description": "Aggregate alert counts grouped by a field to see the "
                            "overall shape of activity (which rule groups, agents, "
                            "tactics, or source IPs are most active). Use this for "
-                           "an overview before drilling in.",
+                           "an overview before drilling in. rule.groups is a "
+                           "controlled vocabulary (not free text) — for brute-force/ "
+                           "failed-login questions, group_by='rule.groups' first to "
+                           "see whether 'authentication_failed' (single failure) or "
+                           "'authentication_failures' (repeated/brute-force pattern) "
+                           "is present, before trying a keyword search.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -795,6 +806,22 @@ def _build_system_prompt(notes=None):
     "Work iteratively: decide which tool to call, read the result, then decide if "
     "you need more data or can conclude. Prefer starting broad (aggregate or "
     "search) then drilling into specific agents and timelines.\n\n"
+    "search_alerts' query IS LITERAL, NOT SEMANTIC — critical: when query has "
+    "multiple words, ALL of them must appear as substrings in the SAME field "
+    "(rule.description or full_log). Guessing phrasing like 'brute-force' or "
+    "'authentication_failed' will return ZERO matches even when the exact "
+    "activity you're looking for exists, because the real alert text may read "
+    "completely differently (e.g. 'Maximum authentication attempts exceeded'). "
+    "A zero-result keyword search means your wording guess failed — it does NOT "
+    "mean the activity is absent. For any detection-style question (brute "
+    "force, failed logins, malware, exfiltration), do NOT start by guessing "
+    "query text. Start with aggregate_alerts(group_by='rule.groups') to see "
+    "the actual controlled-vocabulary group names present, then drill into the "
+    "relevant one. In this environment, 'authentication_failed' (singular) "
+    "tags a single failed login and 'authentication_failures' (plural) tags "
+    "repeated-failure/brute-force-pattern rules — check both. Only after "
+    "aggregation shows genuinely nothing in that group should you conclude no "
+    "such activity occurred.\n\n"
     "TIME WINDOWS — critical: if the user gives no timeframe, default to a BROAD "
     "window (720 hours / 30 days), not 24 hours. Threats commonly span days to "
     "weeks. If any search or timeline returns 0 results, DO NOT conclude 'nothing "
