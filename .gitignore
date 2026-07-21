@@ -1,7 +1,10 @@
 venv/
+.venv_test/
 __pycache__/
 *.pyc
 .env
+.pytest_cache/
+tests/
 
 # Runtime state
 investigations.json

@@ -14,13 +14,25 @@ def _env(p=".env"):
                 os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 _env()
 
+def _require_env(key):
+    """Fail fast instead of silently falling back to a known-weak default
+    credential (e.g. Wazuh's own 'wazuh'/'admin' quick-start passwords) when
+    .env failed to load or a key was mistyped."""
+    val = os.getenv(key)
+    if not val:
+        raise RuntimeError(
+            f"{key} is not set. Refusing to start with a default/weak "
+            f"credential — set {key} in the environment or .env file."
+        )
+    return val
+
 C = {
     "HOST":    os.getenv("WAZUH_HOST",    "https://localhost:55000"),
     "USER":    os.getenv("WAZUH_USER",    "wazuh-agent"),
-    "PASSWD":  os.getenv("WAZUH_PASS",    "wazuh"),
+    "PASSWD":  _require_env("WAZUH_PASS"),
     "IX_HOST": os.getenv("INDEXER_HOST",  "https://localhost:9200"),
     "IX_USER": os.getenv("INDEXER_USER",  "admin"),
-    "IX_PASS": os.getenv("INDEXER_PASS",  "admin"),
+    "IX_PASS": _require_env("INDEXER_PASS"),
     "OL_HOST": os.getenv("OLLAMA_HOST",   "http://localhost:11434"),
     "AGENTIC_MODEL": os.getenv("OLLAMA_MODEL", "qwen3"),
     "AGENTIC_MAX_STEPS": int(os.getenv("AGENTIC_MAX_STEPS", "18")),
