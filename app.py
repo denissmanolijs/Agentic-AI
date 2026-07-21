@@ -174,6 +174,23 @@ def _run_agentic(question, run_id, q=None):
                 ST.history.popitem(last=False)
             ST._save_history()
 
+        # Auto-email manual runs server-side, mirroring the scheduler's auto_email
+        # handling below. A frontend-only trigger (fire after the SSE stream ends)
+        # is unreliable across a multi-minute run if the tab is backgrounded/
+        # throttled or the SSE connection drops before __DONE__ is delivered.
+        with ST.hist_lock:
+            item = ST.history.get(run_id)
+            want_email = bool(item and item.get("auto_email"))
+        if want_email:
+            ok, err = _send_email(item)
+            with ST.hist_lock:
+                if run_id in ST.history:
+                    ST.history[run_id]["email_sent"]  = ok
+                    ST.history[run_id]["email_error"] = None if ok else err
+                ST._save_history()
+            if not ok:
+                log.warning("Auto-email failed for %s: %s", run_id, err)
+
         if q is not None:
             q.put("__DONE__")
         return report
@@ -396,11 +413,13 @@ def agent_stream():
         return Response(busy(), mimetype="text/event-stream")
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    auto_email = request.args.get("email") == "1"
     with ST.hist_lock:
         ST.history[run_id] = {
             "id": run_id, "label": question[:70],
             "started": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "ended": None, "status": "running", "report": "",
+            "auto_email": auto_email,
         }
 
     q = queue.Queue()
@@ -1007,7 +1026,8 @@ function startAgent(question) {
       Math.floor((Date.now()-_t0)/1000) + 's';
   }, 1000);
 
-  _es = new EventSource('/agent?q=' + encodeURIComponent(question));
+  const emailParam = document.getElementById('run-email').checked ? '&email=1' : '';
+  _es = new EventSource('/agent?q=' + encodeURIComponent(question) + emailParam);
   _es.onmessage = (e) => {
     const d = e.data;
     if (d === '__DONE__') { finish(false); return; }
@@ -1045,25 +1065,25 @@ function finish(err) {
   document.getElementById('last-run').textContent =
     'completed ' + new Date().toLocaleTimeString();
   _loadHistoryData();
-  // Capture and clear _curRunId atomically — prevents double-send if finish()
+  // Capture and clear _curRunId atomically — prevents double-read if finish()
   // is called twice (once from onerror, once from onmessage with __DONE__).
   const finishedRunId = _curRunId;
   _curRunId = null;
-  // Skip frontend email for scheduled runs — the scheduler backend sends its own
-  // email via auto_email; sending here too would produce a duplicate.
+  // Email is now sent server-side (inside the run itself, keyed off the
+  // &email=1 flag passed at start) so it isn't tied to this tab staying open
+  // or the SSE connection surviving the whole run. Just read back the result
+  // for the status bar — do NOT re-POST /email here, that would double-send.
+  // Scheduled runs are excluded: their auto_email path doesn't record
+  // email_sent/email_error, so there's nothing meaningful to read back here.
   const isScheduled = finishedRunId && finishedRunId.startsWith('sched_');
   if (finishedRunId && !isScheduled && document.getElementById('run-email').checked) {
-    // Do not gate on !err: SSE errors (connection drop, keepalive timeout) fire
-    // onerror even when the investigation completed successfully. The backend
-    // returns 409 if the run is still in progress, so no partial emails are sent.
     const bar = document.getElementById('last-run');
-    bar.textContent += ' — sending email…';
-    fetch('/email/' + finishedRunId, {method: 'POST'})
-      .then(r => r.json())
-      .then(d => { bar.textContent = d.ok
+    bar.textContent += ' — checking email…';
+    fetch('/history/' + finishedRunId).then(r => r.json()).then(item => {
+      bar.textContent = item.email_sent
         ? 'completed ' + new Date().toLocaleTimeString() + ' — email sent ✓'
-        : 'completed — email failed: ' + (d.error || '?'); })
-      .catch(() => { bar.textContent += ' — email error'; });
+        : 'completed — email failed: ' + (item.email_error || '?');
+    }).catch(() => { bar.textContent += ' — email status unknown'; });
   }
 }
 
