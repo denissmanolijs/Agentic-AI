@@ -21,8 +21,7 @@ _LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent.log"
 _log_fmt  = logging.Formatter("%(asctime)s  %(levelname)s  %(message)s")
 _sh = logging.StreamHandler(sys.stdout)
 _sh.setFormatter(_log_fmt)
-_fh = logging.handlers.RotatingFileHandler(
-    _LOG_FILE, maxBytes=5*1024*1024, backupCount=3, encoding="utf-8")
+_fh = logging.FileHandler(_LOG_FILE, encoding="utf-8")  # rotation handled by OS logrotate (copytruncate)
 _fh.setFormatter(_log_fmt)
 logging.basicConfig(level=logging.INFO, handlers=[_sh, _fh])
 log = logging.getLogger("app")
