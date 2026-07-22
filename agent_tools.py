@@ -431,7 +431,8 @@ def _tool_find_entity_across_agents(entity: str, hours: int = 168):
             "per_agent": agents}
 
 
-def _tool_get_vulnerabilities(agent_id: str = None, cve: str = None, days: int = 30):
+def _tool_get_vulnerabilities(agent_id: str = None, cve: str = None, days: int = 30,
+                              include_solved: bool = False):
 
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     must = [{"range": {"timestamp": {"gte": since}}},
@@ -452,22 +453,41 @@ def _tool_get_vulnerabilities(agent_id: str = None, cve: str = None, days: int =
             {"match_phrase": {"rule.description":           cve_upper}},
         ], "minimum_should_match": 1}})
     q = {"bool": {"must": must}}
+    # A CVE is re-alerted on every scan while active, then gets one final
+    # "Solved" alert once the package is patched — counting raw alert volume
+    # in the window conflates still-open findings with ones already fixed.
+    # Pull the latest status/timestamp per CVE bucket so already-solved
+    # findings can be identified (and excluded by default) rather than
+    # reported as current just because an old "Active" alert falls in-window.
     agg = ag.ix_agg(q, {
         "total":  {"value_count": {"field": "rule.level"}},
         "by_cve": {"terms": {"field": "rule.description", "size": 25,
                              "order": {"mx": "desc"}},
                    "aggs": {"mx": {"max": {"field": "rule.level"}},
-                            "agents": {"terms": {"field": "agent.name", "size": 5}}}},
+                            "agents": {"terms": {"field": "agent.name", "size": 5}},
+                            "latest": {"top_hits": {
+                                "size": 1,
+                                "sort": [{"timestamp": {"order": "desc"}}],
+                                "_source": ["data.vulnerability.status", "timestamp"]}}}},
     })
     cves = []
     for b in agg.get("by_cve", {}).get("buckets", []):
+        hits = b.get("latest", {}).get("hits", {}).get("hits", [])
+        latest_src = hits[0]["_source"] if hits else {}
+        status = (latest_src.get("data") or {}).get("vulnerability", {}).get("status") or "Active"
+        if status == "Solved" and not include_solved:
+            continue
         cves.append({"description": b["key"], "count": b["doc_count"],
                      "max_level": b.get("mx", {}).get("value") or 0,
-                     "agents": [x["key"] for x in b.get("agents", {}).get("buckets", [])]})
+                     "agents": [x["key"] for x in b.get("agents", {}).get("buckets", [])],
+                     "latest_status": status,
+                     "last_seen": (latest_src.get("timestamp") or "")[:19]})
     scope = " | ".join(filter(None, [agent_id, cve])) or "all agents"
     return {"window_days": days, "scope": scope,
-            "total_findings": agg.get("total", {}).get("value", 0),
-            "vulnerabilities": cves}
+            "total_findings": len(cves),
+            "vulnerabilities": cves,
+            "note": ("Already-solved CVEs are excluded — pass include_solved=true to see them."
+                     if not include_solved else "Includes solved CVEs (latest_status='Solved').")}
 
 
 def _tool_get_active_agents(hours: int = 168):
@@ -690,7 +710,15 @@ TOOLS = {
                            "available). Optionally scope to one agent and/or one CVE "
                            "ID. Use this for any question about vulnerabilities, CVEs, "
                            "or patch gaps. To look up a specific CVE pass it as cve=. "
-                           "Returns CVE descriptions, severities, and affected hosts.",
+                           "By default EXCLUDES CVEs whose most recent status is "
+                           "'Solved' (already patched) — pass include_solved=true only "
+                           "if the question is specifically about historical/remediated "
+                           "CVEs. days is independent of any 'hours' used elsewhere in "
+                           "the investigation and defaults to 30 — for a triage scoped "
+                           "to N hours, pass days=ceil(N/24) so this doesn't silently "
+                           "pull in a month of unrelated history. Returns CVE "
+                           "descriptions, severities, affected hosts, and each CVE's "
+                           "latest_status/last_seen.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -699,7 +727,10 @@ TOOLS = {
                     "cve":      {"type": "string",
                                  "description": "Optional — filter to a specific CVE ID, "
                                                 "e.g. 'CVE-2026-44815'"},
-                    "days":     {"type": "integer", "description": "Window (default 30)"},
+                    "days":     {"type": "integer", "description": "Window (default 30) "
+                                                "— align with the investigation's window"},
+                    "include_solved": {"type": "boolean",
+                                 "description": "Include already-patched CVEs (default false)"},
                 },
             },
         },
