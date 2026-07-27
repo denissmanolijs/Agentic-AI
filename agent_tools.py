@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import time
+import inspect
 import logging
 from datetime import datetime, timezone, timedelta
 
@@ -187,7 +188,7 @@ def _resolve_agent(agent_id):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _tool_search_alerts(query: str = "", hours: int = 24, agent_id: str = None,
-                        min_level: int = 0):
+                        min_level: int = 0, rule_group: str = None):
     """Full-text search across alerts (wildcard, keyword-field safe)."""
     since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     must  = [{"range": {"timestamp": {"gte": since}}}]
@@ -199,6 +200,13 @@ def _tool_search_alerts(query: str = "", hours: int = 24, agent_id: str = None,
         must.append({"term": {"agent.id": aid}})
     if min_level:
         must.append({"range": {"rule.level": {"gte": min_level}}})
+    if rule_group:
+        # Exact tag match against rule.groups — this is a controlled-vocabulary
+        # array field, NOT free text. A wildcard/text query for a group name
+        # (e.g. query="breach") will reliably return zero hits even when
+        # aggregate_alerts shows real counts for that group, because the tag
+        # itself rarely appears verbatim in rule.description/full_log.
+        must.append({"term": {"rule.groups": rule_group}})
     q_low  = (query or "").lower().strip()
     should = []
     if q_low:
@@ -255,7 +263,8 @@ def _tool_aggregate_alerts(group_by: str = "rule.groups", hours: int = 24,
     bq = {"bool": {"must": must}}
     allowed = {"rule.groups", "rule.description", "agent.name", "agent.id",
                "rule.level", "rule.mitre.tactic", "rule.mitre.technique",
-               "data.srcip", "data.win.eventdata.image"}
+               "data.srcip", "data.win.eventdata.image",
+               "data.integration", "data.ghe_secrets.repo"}
     # The model sometimes passes multiple comma-separated fields; take the
     # first valid one (single-field aggregation only) so it isn't silently wrong.
     requested = [f.strip() for f in str(group_by).split(",")]
@@ -289,6 +298,7 @@ def _tool_get_agent_timeline(agent_id: str, hours: int = 6, min_level: int = 0):
         "level": (h.get("rule", {}) or {}).get("level"),
         "desc":  (h.get("rule", {}) or {}).get("description", ""),
         "tactic": (h.get("rule", {}) or {}).get("mitre", {}).get("tactic", []),
+        "groups": (h.get("rule", {}) or {}).get("groups", []),
     } for h in hits.get("hits", [])]
     return {"agent": _resolve_agent(agent_id), "window_hours": hours,
             "event_count": len(events), "timeline": events[:40]}
@@ -369,6 +379,7 @@ def _tool_get_event_sequence(agent_id: str, around_time: str = None,
             "level":  (h.get("rule", {}) or {}).get("level", 0),
             "event":  desc,
             "tactic": (h.get("rule", {}) or {}).get("mitre", {}).get("tactic", []),
+            "groups": (h.get("rule", {}) or {}).get("groups", []),
             "process":     (win.get("image", "") or "").split("\\")[-1],
             "parent":      (win.get("parentImage", "") or "").split("\\")[-1],
             "command":     (win.get("commandLine", "") or "")[:160],
@@ -432,7 +443,12 @@ def _tool_find_entity_across_agents(entity: str, hours: int = 168):
 
 
 def _tool_get_vulnerabilities(agent_id: str = None, cve: str = None, days: int = 30,
-                              include_solved: bool = False):
+                              include_solved: bool = False, hours: int = None):
+    # The model frequently reaches for hours= here by analogy with every other
+    # tool, even though this endpoint is day-granular — accept it as an alias
+    # instead of erroring, so a plausible-looking call doesn't burn a step.
+    if hours:
+        days = max(1, -(-hours // 24))
 
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     must = [{"range": {"timestamp": {"gte": since}}},
@@ -544,25 +560,35 @@ TOOLS = {
             "description": "Search security alerts. query is OPTIONAL — omit it (or "
                            "pass empty) to match ALL alerts and filter only by "
                            "hours/agent_id/min_level (e.g. 'all severity-12 events'). "
-                           "Provide a keyword/phrase/IP/hash to narrow. LITERAL "
-                           "substring match, not semantic: a multi-word query "
-                           "requires ALL words to appear in the same field, so a "
-                           "wrong wording guess returns zero matches even when "
-                           "matching alerts exist. For brute-force/failed-login "
-                           "questions, call aggregate_alerts(group_by='rule.groups') "
-                           "first to find the real group name instead of guessing "
-                           "text. Returns match count, max severity, and sample events.",
+                           "query is a LITERAL substring match against rule.description/ "
+                           "full_log, not semantic and NOT a field filter: a multi-word "
+                           "query requires ALL words to appear in the same field, so a "
+                           "wrong wording guess returns zero matches even when matching "
+                           "alerts exist, and group tag names (e.g. 'breach', 'insider', "
+                           "'secrets_detected') will almost always return ZERO matches "
+                           "via query even when aggregate_alerts shows real counts for "
+                           "that group, because the tag rarely appears verbatim in the "
+                           "log text. To pull sample events from a group you saw in "
+                           "aggregate_alerts, pass it as rule_group= (exact match), NOT "
+                           "as query=. Returns match count, max severity, and sample "
+                           "events.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query":     {"type": "string",
-                                  "description": "Keyword/phrase/IP/hash to search"},
-                    "hours":     {"type": "integer",
-                                  "description": "Look-back window in hours (default 24)"},
-                    "agent_id":  {"type": "string",
-                                  "description": "Optional agent ID to scope to one host"},
-                    "min_level": {"type": "integer",
-                                  "description": "Optional minimum Wazuh severity (0-15)"},
+                    "query":      {"type": "string",
+                                   "description": "Keyword/phrase/IP/hash to search "
+                                   "(literal substring, not a rule.groups tag)"},
+                    "hours":      {"type": "integer",
+                                   "description": "Look-back window in hours (default 24)"},
+                    "agent_id":   {"type": "string",
+                                   "description": "Optional agent ID to scope to one host"},
+                    "min_level":  {"type": "integer",
+                                   "description": "Optional minimum Wazuh severity (0-15)"},
+                    "rule_group": {"type": "string",
+                                   "description": "Exact rule.groups tag to filter by "
+                                   "(e.g. 'breach', 'insider', 'secrets_detected', "
+                                   "'sophos_fw_ng') — use this, not query=, to pull "
+                                   "sample events for a group seen in aggregate_alerts"},
                 },
                 "required": [],
             },
@@ -587,7 +613,10 @@ TOOLS = {
                     "group_by":  {"type": "string",
                                   "description": "ONE field only (not a list): rule.groups, "
                                   "rule.description, agent.name, agent.id, "
-                                  "rule.mitre.tactic, or data.srcip"},
+                                  "rule.mitre.tactic, data.srcip, data.integration "
+                                  "(which agentless integration a finding came from, "
+                                  "e.g. ghe-secrets, sophos), or data.ghe_secrets.repo "
+                                  "(which repo has the most secret-scanner findings)"},
                     "hours":     {"type": "integer"},
                     "agent_id":  {"type": "string"},
                     "min_level": {"type": "integer"},
@@ -713,11 +742,12 @@ TOOLS = {
                            "By default EXCLUDES CVEs whose most recent status is "
                            "'Solved' (already patched) — pass include_solved=true only "
                            "if the question is specifically about historical/remediated "
-                           "CVEs. days is independent of any 'hours' used elsewhere in "
-                           "the investigation and defaults to 30 — for a triage scoped "
-                           "to N hours, pass days=ceil(N/24) so this doesn't silently "
-                           "pull in a month of unrelated history. Returns CVE "
-                           "descriptions, severities, affected hosts, and each CVE's "
+                           "CVEs. Windowing here is day-granular and defaults to 30 days "
+                           "— prefer days= (e.g. days=ceil(N/24) for an N-hour triage) so "
+                           "this doesn't silently pull in a month of unrelated history; "
+                           "hours= is also accepted as a convenience alias and is rounded "
+                           "up to whole days internally. Returns CVE descriptions, "
+                           "severities, affected hosts, and each CVE's "
                            "latest_status/last_seen.",
             "parameters": {
                 "type": "object",
@@ -729,6 +759,10 @@ TOOLS = {
                                                 "e.g. 'CVE-2026-44815'"},
                     "days":     {"type": "integer", "description": "Window (default 30) "
                                                 "— align with the investigation's window"},
+                    "hours":    {"type": "integer",
+                                 "description": "Alias for days, rounded up to whole days "
+                                                "(e.g. hours=48 -> days=2). Use days= "
+                                                "directly when you can."},
                     "include_solved": {"type": "boolean",
                                  "description": "Include already-patched CVEs (default false)"},
                 },
@@ -809,7 +843,7 @@ def _build_system_prompt(notes=None):
     "devices (Sophos firewall, Palo Alto, Fortinet, Cisco ASA, etc.). Nearly all "
     "alerts under agent ID 000 are events FROM those external systems — they are "
     "NOT attacks on the manager host itself.\n"
-    "DETERMINING THE REAL TARGET — there are three classes of agent 000 alert:\n"
+    "DETERMINING THE REAL TARGET — there are four classes of agent 000 alert:\n"
     "1. CLOUD SERVICE INTEGRATION (rule groups: office365, aws, azure, gcp, github, "
     "slack, etc.) — the event happened inside that cloud service. The Wazuh manager "
     "is the API poller; it is not involved in the incident at all.\n"
@@ -824,6 +858,19 @@ def _build_system_prompt(notes=None):
     "authentication_failed, sshd, pam, ossec) — these indicate something actually "
     "happening on the manager OS itself. Only here is the manager potentially "
     "the target.\n"
+    "4. SECRET/CREDENTIAL SCANNER FINDING (rule groups: ghe_secrets, "
+    "secrets_detected, credential_exposure, gitleaks, trufflehog, or similar; "
+    "MITRE T1552 Unsecured Credentials) — a source-code scanner (e.g. GitHub "
+    "Enterprise secret scanning) found a live-looking credential committed to a "
+    "repo. The Wazuh manager only relayed the finding — it is NOT compromised and "
+    "there is no network attacker to trace. The real target is the LEAKED "
+    "CREDENTIAL/SERVICE itself: read data.ghe_secrets.repo, .file, .commit, "
+    ".author/.email, and .rule_id (the secret type) to identify what leaked, "
+    "where, and by whom. Do NOT treat this as low-severity just because it maps "
+    "to class 1's 'not involved in the incident' framing — an exposed live "
+    "credential is an active, actionable exposure regardless of rule.level, and "
+    "the recommended action is always to revoke/rotate the credential and purge "
+    "it from git history, not to investigate the manager or a host.\n"
     "Always identify which class an alert belongs to BEFORE naming a target. For "
     "password-spray, brute-force, or connection alerts from a firewall integration, "
     "read the destination IP from the alert data to name the actual victim host.\n"
@@ -848,11 +895,15 @@ def _build_system_prompt(notes=None):
     "force, failed logins, malware, exfiltration), do NOT start by guessing "
     "query text. Start with aggregate_alerts(group_by='rule.groups') to see "
     "the actual controlled-vocabulary group names present, then drill into the "
-    "relevant one. In this environment, 'authentication_failed' (singular) "
-    "tags a single failed login and 'authentication_failures' (plural) tags "
-    "repeated-failure/brute-force-pattern rules — check both. Only after "
-    "aggregation shows genuinely nothing in that group should you conclude no "
-    "such activity occurred.\n\n"
+    "relevant one with search_alerts(rule_group=<that exact group name>) — NEVER "
+    "pass a group name (e.g. 'breach', 'insider', 'secrets_detected') as query=, "
+    "since group tags essentially never appear verbatim in the log text and "
+    "query= will reliably return zero even when the group has real alerts. In "
+    "this environment, 'authentication_failed' (singular) tags a single failed "
+    "login and 'authentication_failures' (plural) tags repeated-failure/"
+    "brute-force-pattern rules — check both. Only after "
+    "search_alerts(rule_group=...) shows genuinely nothing should you conclude "
+    "no such activity occurred.\n\n"
     "TIME WINDOWS — critical: if the user gives no timeframe, default to a BROAD "
     "window (720 hours / 30 days), not 24 hours. Threats commonly span days to "
     "weeks. If any search or timeline returns 0 results, DO NOT conclude 'nothing "
@@ -1020,8 +1071,18 @@ def run_agent(question: str, agent_id: str = None, emit=None, context=None):
                 result = {"error": f"unknown tool {name}"}
             else:
                 fn = entry[0]
+                # Drop any arguments the tool doesn't accept (e.g. the model
+                # guessing a parameter from another tool, like group_by= on
+                # search_alerts) instead of hard-failing — a stray extra kwarg
+                # shouldn't derail an unattended run into a dead-end error or,
+                # worse, a permission-seeking question with no one to answer it.
+                valid_params = set(inspect.signature(fn).parameters)
+                unknown = set(args) - valid_params
+                if unknown:
+                    log.debug("Tool %s: dropping unsupported args %s", name, unknown)
+                filtered_args = {k: v for k, v in args.items() if k in valid_params}
                 try:
-                    result = fn(**args)
+                    result = fn(**filtered_args)
                 except TypeError as e:
                     result = {"error": f"bad arguments: {e}"}
                 except Exception as e:

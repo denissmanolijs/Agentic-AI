@@ -230,6 +230,14 @@ JSON schema (use exactly these keys):
   "iocs": ["ip/hash/username/domain — omit if none"]
 }}"""
 
+_SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+
+
+def _normalize_severity(value):
+    v = str(value or "info").strip().lower()
+    return v if v in _SEVERITY_RANK else "info"
+
+
 def _generate_structured(question, final, audit):
     """Call the LLM a second time to turn the free-text answer into structured JSON.
     Returns a dict on success, None on any failure (graceful degradation)."""
@@ -250,7 +258,36 @@ def _generate_structured(question, final, audit):
             if text.startswith("json"):
                 text = text[4:]
             text = text.strip()
-        return json.loads(text)
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError("structured output was not a JSON object")
+
+        # The formatting pass sometimes returns valid-but-incomplete JSON
+        # (e.g. severity/affected_hosts/iocs missing entirely) — backfill so
+        # a report never silently renders as blank/absent instead of what it
+        # actually found.
+        data.setdefault("executive_summary", "")
+        data.setdefault("affected_hosts", [])
+        data.setdefault("key_findings", [])
+        data.setdefault("recommendations", [])
+        data.setdefault("iocs", [])
+
+        for f in data["key_findings"]:
+            if isinstance(f, dict):
+                f["severity"] = _normalize_severity(f.get("severity"))
+
+        # Derive the overall severity from the worst per-finding severity
+        # rather than trusting a second, independent LLM guess for the
+        # top-level field — the same underlying findings were otherwise
+        # coming out as 'high' one run and 'critical' another, because the
+        # model had to infer one word from unstructured prose each time.
+        finding_sevs = [f["severity"] for f in data["key_findings"] if isinstance(f, dict)]
+        if finding_sevs:
+            data["severity"] = max(finding_sevs, key=lambda s: _SEVERITY_RANK[s])
+        else:
+            data["severity"] = _normalize_severity(data.get("severity"))
+
+        return data
     except Exception as e:
         log.warning("Structured report generation failed: %s", e)
         return None
