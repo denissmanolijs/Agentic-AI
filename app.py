@@ -673,6 +673,7 @@ HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <title>Agentic Security Analyst</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🛡️</text></svg>">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:monospace;background:#0d1117;color:#e6edf3;
