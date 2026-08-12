@@ -212,6 +212,8 @@ summarise the analyst's own words for the executive_summary field. Do not add fi
 IOCs, hosts, or severity levels that are not present in the findings text.
 
 Return ONLY valid JSON — no markdown, no explanation.
+Write every string value in English only, even if the findings text below \
+contains another language.
 
 QUESTION: {question}
 
