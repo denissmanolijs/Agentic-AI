@@ -57,6 +57,11 @@ OLLAMA_THINK=false      # see "Must-know: OLLAMA_THINK" below before enabling
 
 # -- Optional tuning --
 AGENTIC_MAX_STEPS=18            # max tool calls per investigation
+AGENTIC_MAX_SECONDS=900         # wall-clock ceiling per investigation (15 min);
+                                 # independent of AGENTIC_MAX_STEPS — raise this
+                                 # if your model/hardware is slow and you'd
+                                 # rather wait longer than get a step-capped
+                                 # answer
 UI_HOST=0.0.0.0                 # interface the web UI binds to
 UI_PORT=5000                    # web UI port
 
@@ -133,6 +138,17 @@ http://<host>:5000
   (e.g. `qwen3:8b`). On a 14B+ model, thinking mode has been observed to push
   a single investigation to 9+ hours. Leave it `false` unless you've
   benchmarked your specific model.
+- **A run always ends within `AGENTIC_MAX_SECONDS` (default 15 min), even if
+  it hasn't converged.** `AGENTIC_MAX_STEPS` only caps *tool-call count* — it
+  does not bound wall-clock time if individual model calls are slow. Past the
+  time budget, the agent is forced straight to a final answer from whatever
+  evidence it already gathered, same as hitting the step cap. If any rule
+  group it flagged as needing a sample (severity >= 12, or
+  `vulnerability-detector`) never got one before that happened, the answer
+  gets a `[COVERAGE GAP: ...]` note appended — treat those specific claims as
+  unconfirmed and re-run `search_alerts(rule_group=...)` on them by hand.
+  Raise `AGENTIC_MAX_SECONDS` if your model/hardware is slow and you'd rather
+  wait longer for a fully-converged answer than get a time-capped one.
 - **Keep Context-tab notes to durable environment facts, not incident
   details.** The notes text is injected unconditionally into every run's
   system prompt, including scheduled runs days or weeks later. A note like

@@ -14,7 +14,23 @@ log = logging.getLogger("agent")
 
 AGENTIC_MODEL = ag.C["AGENTIC_MODEL"]
 OL_HOST       = ag.C["OL_HOST"]
-MAX_STEPS     = ag.C["AGENTIC_MAX_STEPS"]   # safety cap on the loop
+MAX_STEPS     = ag.C["AGENTIC_MAX_STEPS"]     # safety cap on tool-call count
+MAX_SECONDS   = ag.C["AGENTIC_MAX_SECONDS"]   # safety cap on wall-clock time
+
+# Rule groups that are well-understood, high-volume cloud/network integration
+# noise (see the WAZUH INFRASTRUCTURE classes 1/2 in _build_system_prompt).
+# The model already classifies these correctly and cheaply without a sample
+# pull — forcing a mandatory drill-down on every one of them just because
+# they cross severity 12 (which SharePoint/Sophos traffic routinely does)
+# is what made triage runs balloon in step count and wall-clock time for no
+# decision-value gain. The coverage guardrail below only hard-enforces
+# drill-down on groups OUTSIDE this list (e.g. breach, insider) plus
+# vulnerability-detector specifically — i.e. exactly the cases that were
+# observed going out with zero evidence, not the routine integrations.
+_KNOWN_INTEGRATION_GROUPS = {
+    "office365", "sharepoint", "aws", "azure", "gcp", "github", "slack",
+    "sophos", "paloalto", "fortinet", "cisco", "asa", "firewall", "ids", "ips",
+}
 
 _agent_cache = {}        # normalised key -> numeric id string
 _agent_cache_ts  = 0.0   # unix timestamp of last full cache build
@@ -1026,12 +1042,25 @@ def run_agent(question: str, agent_id: str = None, emit=None, context=None):
     # follows up with search_alerts(rule_group=...) / get_vulnerabilities().
     pending_drill = {}
     nudge_count   = 0
-    MAX_NUDGES    = 2   # cap forced retries so a non-compliant model can't loop forever
+    MAX_NUDGES    = 1   # cap forced retries — narrow guardrail scope (below)
+                        # already keeps this cheap, so one retry is enough
+    start_ts      = time.time()
 
     for step in range(MAX_STEPS):
         if ag.STOP_FLAG.is_set():
             _emit("error", "Stopped by user.")
             return "[stopped]"
+
+        # Wall-clock ceiling, independent of step count — MAX_STEPS bounds
+        # tool-call *count*, not runtime. If individual model calls are slow
+        # (large/thinking model, no GPU, growing context), the step budget
+        # alone can still let one investigation run for hours. Bail into the
+        # same "write your final answer now" path used for the step cap.
+        elapsed = time.time() - start_ts
+        if elapsed > MAX_SECONDS:
+            _emit("error", f"Time budget exceeded ({int(elapsed)}s > "
+                           f"{MAX_SECONDS}s) — forcing final answer.")
+            break
 
         try:
             resp = client.chat(
@@ -1057,7 +1086,9 @@ def run_agent(question: str, agent_id: str = None, emit=None, context=None):
             answer = msg.content or "(no answer)"
 
             # ── Enforce the coverage guardrail before accepting "done" ──────
-            if pending_drill and nudge_count < MAX_NUDGES and step < MAX_STEPS - 1:
+            if (pending_drill and nudge_count < MAX_NUDGES
+                    and step < MAX_STEPS - 1
+                    and (time.time() - start_ts) < MAX_SECONDS):
                 nudge_count += 1
                 todo = ", ".join(f"{g} (max severity {lvl})"
                                  for g, lvl in pending_drill.items())
@@ -1147,8 +1178,14 @@ def run_agent(question: str, agent_id: str = None, emit=None, context=None):
             if name == "aggregate_alerts" and isinstance(result, dict) \
                     and result.get("grouped_by") == "rule.groups":
                 for b in result.get("buckets", []):
-                    # Any group at severity >= 12 needs a sample pulled.
-                    if b.get("max_level", 0) >= 12:
+                    # A group at severity >= 12 needs a sample pulled — unless
+                    # it's a known high-volume cloud/network integration
+                    # (SharePoint, Sophos, etc. routinely hit 12-14 for
+                    # ordinary traffic). Forcing a mandatory drill-down on
+                    # those too is what made triage runs balloon in step
+                    # count and wall-clock time for zero decision value.
+                    if b.get("max_level", 0) >= 12 \
+                            and b["key"] not in _KNOWN_INTEGRATION_GROUPS:
                         pending_drill.setdefault(b["key"], b["max_level"])
                     # vulnerability-detector needs get_vulnerabilities()
                     # regardless of rule.level — CVE severity isn't carried
@@ -1164,15 +1201,16 @@ def run_agent(question: str, agent_id: str = None, emit=None, context=None):
             messages.append({"role": "tool", "name": name,
                              "content": json.dumps(result)[:4000]})
 
-    # Hit the step cap — force a final text answer.
+    # Hit the step cap or the time budget — force a final text answer.
     # Crucially: do NOT pass tools, so the model cannot ask for more calls and
     # must produce prose. Retry once if it still comes back empty.
     messages.append({"role": "user",
                      "content": "STOP investigating now — you have reached the "
-                                "step limit. Do NOT request any more tools. Based "
-                                "ONLY on the evidence already gathered above, write "
-                                "your complete final answer now: verdict, the "
-                                "specific events/entities/timestamps you found, what "
+                                "step or time limit. Do NOT request any more "
+                                "tools. Based ONLY on the evidence already "
+                                "gathered above, write your complete final "
+                                "answer now: verdict, the specific "
+                                "events/entities/timestamps you found, what "
                                 "attack chain they represent, and recommended actions."})
     answer = ""
     for _try in range(2):
@@ -1202,7 +1240,8 @@ def run_agent(question: str, agent_id: str = None, emit=None, context=None):
                   "groups as UNCONFIRMED and re-run "
                   "search_alerts(rule_group=...) on them manually.]")
     _emit("answer", answer)
-    _emit("done", {"steps": MAX_STEPS, "audit": audit, "capped": True})
+    _emit("done", {"steps": len(audit), "audit": audit, "capped": True,
+                   "elapsed_seconds": int(time.time() - start_ts)})
     return answer
 
 
