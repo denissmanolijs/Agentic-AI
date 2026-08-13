@@ -245,13 +245,23 @@ def _generate_structured(question, final, audit):
     Returns a dict on success, None on any failure (graceful degradation)."""
     if not final or final.startswith("[error"):
         return None
+    # A long-running investigation (many tool calls, a verbose final synthesis)
+    # can produce a `final` text long enough to blow past this call's context
+    # window — unlike the main loop's client.chat(), which sets num_ctx=16384,
+    # this one previously used Ollama's Modelfile default (often 2048-4096),
+    # silently truncating the model's JSON mid-output and making this whole
+    # function return None with no visible error (a missing Formatted/Raw
+    # toggle in the UI is the only symptom). Cap `final` defensively and match
+    # the main loop's context size so a marathon run doesn't kill structuring.
+    if len(final) > 12000:
+        final = final[:12000] + "\n...[truncated for structuring]"
     try:
         cl = ollama.Client(host=ag.C["OL_HOST"])
         resp = cl.chat(
             model=ag.C["AGENTIC_MODEL"],
             messages=[{"role": "user",
                        "content": _STRUCT_PROMPT.replace("{question}", question).replace("{final}", final)}],
-            options={"temperature": 0.1, "think": False},
+            options={"temperature": 0.1, "think": False, "num_ctx": 16384},
         )
         text = (resp.get("message") or {}).get("content", "").strip()
         # Strip markdown code fences if the model wraps the JSON
@@ -260,7 +270,16 @@ def _generate_structured(question, final, audit):
             if text.startswith("json"):
                 text = text[4:]
             text = text.strip()
-        data = json.loads(text)
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            # Log a preview of what actually came back — the bare exception
+            # message alone ("Expecting value: line 1 column 1") gives no way
+            # to tell truncation, an empty response, and prose-instead-of-JSON
+            # apart after the fact.
+            log.warning("Structured report: model returned non-JSON "
+                       "(len=%d): %r", len(text), text[:300])
+            return None
         if not isinstance(data, dict):
             raise ValueError("structured output was not a JSON object")
 

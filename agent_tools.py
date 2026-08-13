@@ -29,7 +29,13 @@ MAX_SECONDS   = ag.C["AGENTIC_MAX_SECONDS"]   # safety cap on wall-clock time
 # observed going out with zero evidence, not the routine integrations.
 _KNOWN_INTEGRATION_GROUPS = {
     "office365", "sharepoint", "aws", "azure", "gcp", "github", "slack",
-    "sophos", "paloalto", "fortinet", "cisco", "asa", "firewall", "ids", "ips",
+    # "sophos_fw_ng" is this environment's actual rule.groups tag for the
+    # Sophos firewall integration (see the search_alerts tool description
+    # below and rule design), not the generic "sophos" — keep both so the
+    # allowlist still works if a differently-configured deployment (or a
+    # future rename) uses the plain name instead.
+    "sophos", "sophos_fw_ng",
+    "paloalto", "fortinet", "cisco", "asa", "firewall", "ids", "ips",
 }
 
 _agent_cache = {}        # normalised key -> numeric id string
