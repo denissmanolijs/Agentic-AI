@@ -1216,6 +1216,30 @@ def run_agent(question: str, agent_id: str = None, emit=None, context=None):
                              "content": json.dumps(result)[:4000]})
 
     # Hit the step cap or the time budget — force a final text answer.
+    if not audit:
+        # Zero tool calls means the very first model call itself errored or
+        # timed out — there is no evidence of any kind to summarize. Asking
+        # the model for a "final answer" in this state has nothing real to
+        # work from except its own priors, which is exactly how you get a
+        # fabricated, confident "no alerts found / no action required"
+        # verdict with zero investigation behind it (observed in practice).
+        # Skip the model call entirely rather than invite that; state the
+        # failure plainly and skip straight past the SHALLOW-marker logic
+        # below (this deserves a much stronger message than "preliminary").
+        answer = ("[INVESTIGATION FAILED: no tool calls completed before the "
+                 "step/time budget was reached — see the error above for why "
+                 "the first model call didn't succeed. There is NO evidence "
+                 "behind this run; it is not a clean result, it means the "
+                 "investigation could not start. Re-run the question, check "
+                 "Ollama/Wazuh connectivity and Ollama server load (a cold "
+                 "model load or a busy inference slot can exceed "
+                 "AGENTIC_CALL_TIMEOUT on the very first request), and raise "
+                 "AGENTIC_CALL_TIMEOUT if this keeps happening.]")
+        _emit("answer", answer)
+        _emit("done", {"steps": 0, "audit": audit, "capped": True,
+                       "elapsed_seconds": int(time.time() - start_ts)})
+        return answer
+
     # Crucially: do NOT pass tools, so the model cannot ask for more calls and
     # must produce prose. Retry once if it still comes back empty.
     messages.append({"role": "user",
@@ -1251,7 +1275,8 @@ def run_agent(question: str, agent_id: str = None, emit=None, context=None):
     # the model's own wording (e.g. "no confirmed incidents") reads exactly
     # like a thorough clean result instead of a rushed, mostly-unexplored
     # one. Flag that distinction explicitly rather than let a shallow pass
-    # masquerade as a validated all-clear.
+    # masquerade as a validated all-clear. (audit is non-empty here — the
+    # audit == 0 case returned early above with a stronger message.)
     SHALLOW_CALL_THRESHOLD = 4
     if len(audit) < SHALLOW_CALL_THRESHOLD:
         answer += (f"\n\n[SHALLOW INVESTIGATION: only {len(audit)} tool call(s) "
