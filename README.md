@@ -57,11 +57,15 @@ OLLAMA_THINK=false      # see "Must-know: OLLAMA_THINK" below before enabling
 
 # -- Optional tuning --
 AGENTIC_MAX_STEPS=18            # max tool calls per investigation
-AGENTIC_MAX_SECONDS=900         # wall-clock ceiling per investigation (15 min);
-                                 # independent of AGENTIC_MAX_STEPS — raise this
-                                 # if your model/hardware is slow and you'd
-                                 # rather wait longer than get a step-capped
-                                 # answer
+AGENTIC_MAX_SECONDS=3600        # wall-clock ceiling per investigation (1h);
+                                 # independent of AGENTIC_MAX_STEPS. Mainly
+                                 # bounds unattended scheduled runs — a manual
+                                 # Run-tab investigation can always be cut
+                                 # short with the Stop button regardless.
+                                 # Lower it for faster (but shallower —
+                                 # possibly generic, missing hostnames/IPs)
+                                 # reports; raise it for deeper (but slower)
+                                 # ones on slow hardware/large models.
 UI_HOST=0.0.0.0                 # interface the web UI binds to
 UI_PORT=5000                    # web UI port
 
@@ -138,17 +142,29 @@ http://<host>:5000
   (e.g. `qwen3:8b`). On a 14B+ model, thinking mode has been observed to push
   a single investigation to 9+ hours. Leave it `false` unless you've
   benchmarked your specific model.
-- **A run always ends within `AGENTIC_MAX_SECONDS` (default 15 min), even if
+- **A run always ends within `AGENTIC_MAX_SECONDS` (default 1h), even if
   it hasn't converged.** `AGENTIC_MAX_STEPS` only caps *tool-call count* — it
   does not bound wall-clock time if individual model calls are slow. Past the
   time budget, the agent is forced straight to a final answer from whatever
-  evidence it already gathered, same as hitting the step cap. If any rule
-  group it flagged as needing a sample (severity >= 12, or
-  `vulnerability-detector`) never got one before that happened, the answer
-  gets a `[COVERAGE GAP: ...]` note appended — treat those specific claims as
-  unconfirmed and re-run `search_alerts(rule_group=...)` on them by hand.
-  Raise `AGENTIC_MAX_SECONDS` if your model/hardware is slow and you'd rather
-  wait longer for a fully-converged answer than get a time-capped one.
+  evidence it already gathered, same as hitting the step cap. Two markers
+  can appear on a forced answer, and both mean "don't take this as a clean
+  bill of health":
+  - `[COVERAGE GAP: ...]` — a rule group it flagged as needing a sample
+    (severity >= 12, or `vulnerability-detector`) never got one. Treat that
+    specific claim as unconfirmed and re-run `search_alerts(rule_group=...)`
+    on it by hand.
+  - `[SHALLOW INVESTIGATION: ...]` — fewer than 4 tool calls completed
+    total before the cutoff (well under the 6-10 a real investigation
+    typically needs). A shallow, generic-sounding report (no hostnames/IPs/
+    usernames where the old detailed ones had them) with this marker means
+    the budget cut it off too early for this model/hardware, not that the
+    environment is actually clean — raise `AGENTIC_MAX_STEPS` and/or
+    `AGENTIC_MAX_SECONDS` and re-run.
+  Lower `AGENTIC_MAX_SECONDS` for a tighter worst-case runtime at the cost of
+  shallower reports; raise it for deeper investigations at the cost of a
+  longer worst case. There's no value that's simultaneously fast and deep on
+  slow hardware — the historical detailed reports on this deployment took
+  ~3h20m to reach get_agent_timeline/get_inventory/per-CVE depth.
 - **Keep Context-tab notes to durable environment facts, not incident
   details.** The notes text is injected unconditionally into every run's
   system prompt, including scheduled runs days or weeks later. A note like

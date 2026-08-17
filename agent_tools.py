@@ -1021,7 +1021,7 @@ def run_agent(question: str, agent_id: str = None, emit=None, context=None):
             elif kind == "error":
                 print(f"\n[ERROR] {payload}")
 
-    client = ollama.Client(host=OL_HOST)
+    client = ollama.Client(host=OL_HOST, timeout=ag.C["AGENTIC_CALL_TIMEOUT"])
 
     ctx = context or {}
     system_prompt = _build_system_prompt(notes=(ctx.get("notes") or None))
@@ -1077,8 +1077,16 @@ def run_agent(question: str, agent_id: str = None, emit=None, context=None):
                          "think": ag.C["AGENTIC_THINK"]},
             )
         except Exception as e:
-            _emit("error", f"Model call failed: {e}")
-            return f"[error: {e}]"
+            # Don't discard whatever was already gathered — a transient
+            # error (timeout, connection reset) mid-investigation used to
+            # hard-return a bare "[error: ...]" string here, throwing away
+            # every tool call made so far. Fall through to the same forced-
+            # answer path used for the step/time cap instead, so a partial
+            # audit trail plus the SHALLOW/COVERAGE-GAP markers still reach
+            # the analyst even when the model call itself failed.
+            _emit("error", f"Model call failed ({e}) — forcing a final "
+                           "answer from evidence gathered so far.")
+            break
 
         if ag.STOP_FLAG.is_set():
             _emit("error", "Stopped by user.")
@@ -1237,6 +1245,22 @@ def run_agent(question: str, agent_id: str = None, emit=None, context=None):
                   + str(len(audit)) + " tool calls but did not produce a final "
                   "summary within the step limit. See the tool-call audit for "
                   "the raw findings.]")
+    # A forced cutoff (step or time budget) with very few tool calls behind
+    # it produces a verdict built on almost no evidence — the system prompt
+    # normally expects 6-10 calls to reach a real conclusion. Left alone,
+    # the model's own wording (e.g. "no confirmed incidents") reads exactly
+    # like a thorough clean result instead of a rushed, mostly-unexplored
+    # one. Flag that distinction explicitly rather than let a shallow pass
+    # masquerade as a validated all-clear.
+    SHALLOW_CALL_THRESHOLD = 4
+    if len(audit) < SHALLOW_CALL_THRESHOLD:
+        answer += (f"\n\n[SHALLOW INVESTIGATION: only {len(audit)} tool call(s) "
+                  "completed before the step/time budget was reached — well "
+                  "under the 6-10 typically needed to reach a real verdict. "
+                  "Treat the assessment above as PRELIMINARY, not a validated "
+                  "clean result. Re-run this question, or raise "
+                  "AGENTIC_MAX_STEPS/AGENTIC_MAX_SECONDS if this keeps "
+                  "happening.]")
     if pending_drill:
         gaps = ", ".join(f"{g} (max severity {lvl})"
                          for g, lvl in pending_drill.items())

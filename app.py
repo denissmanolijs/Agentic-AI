@@ -256,7 +256,7 @@ def _generate_structured(question, final, audit):
     if len(final) > 12000:
         final = final[:12000] + "\n...[truncated for structuring]"
     try:
-        cl = ollama.Client(host=ag.C["OL_HOST"])
+        cl = ollama.Client(host=ag.C["OL_HOST"], timeout=ag.C["AGENTIC_CALL_TIMEOUT"])
         resp = cl.chat(
             model=ag.C["AGENTIC_MODEL"],
             messages=[{"role": "user",

@@ -40,7 +40,24 @@ C = {
     # a step cap alone doesn't bound runtime if individual model calls are
     # slow (large model, no GPU, big num_ctx). Forces the same "write your
     # final answer now" path used for the step cap once elapsed time is up.
-    "AGENTIC_MAX_SECONDS": int(os.getenv("AGENTIC_MAX_SECONDS", "900")),
+    # 900s (15 min) was tried first and cut investigations off after only a
+    # handful of tool calls on a 14B model — enough to trigger the coverage
+    # guardrail's gap note, not enough to reach get_agent_timeline/
+    # get_inventory/get_vulnerabilities depth, so reports came back generic
+    # (no hostnames/IPs/usernames) instead of just slower. 3600s (1h) trades
+    # a longer worst case for actually letting a scheduled/unattended run
+    # reach that depth — this mainly matters for background scheduled runs;
+    # a manual Run-tab investigation someone is watching live can always be
+    # cut short with the Stop button regardless of this value.
+    "AGENTIC_MAX_SECONDS": int(os.getenv("AGENTIC_MAX_SECONDS", "3600")),
+    # Per-HTTP-call timeout to Ollama (forwarded to the underlying httpx
+    # client). AGENTIC_MAX_SECONDS is only checked BETWEEN turns — a single
+    # call that itself hangs (server wedged, network stall) would otherwise
+    # block past the wall-clock budget indefinitely with nothing to catch
+    # it. Generous by design: this should only fire for a genuinely stuck
+    # request, not a slow-but-completing one — raise it if legitimate calls
+    # on your hardware/model are timing out.
+    "AGENTIC_CALL_TIMEOUT": int(os.getenv("AGENTIC_CALL_TIMEOUT", "1200")),
     # Set true only for small/fast models (e.g. qwen3:8b); 14b+ becomes 9+ hrs
     "AGENTIC_THINK": os.getenv("OLLAMA_THINK", "false").lower() == "true",
     "UI_PORT": int(os.getenv("UI_PORT", "5000")),
