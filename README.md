@@ -57,7 +57,7 @@ OLLAMA_THINK=false      # see "Must-know: OLLAMA_THINK" below before enabling
 
 # -- Optional tuning --
 AGENTIC_MAX_STEPS=18            # max tool calls per investigation
-AGENTIC_MAX_SECONDS=3600        # wall-clock ceiling per investigation (1h);
+AGENTIC_MAX_SECONDS=18000       # wall-clock ceiling per investigation (5h);
                                  # independent of AGENTIC_MAX_STEPS. Mainly
                                  # bounds unattended scheduled runs — a manual
                                  # Run-tab investigation can always be cut
@@ -66,6 +66,15 @@ AGENTIC_MAX_SECONDS=3600        # wall-clock ceiling per investigation (1h);
                                  # possibly generic, missing hostnames/IPs)
                                  # reports; raise it for deeper (but slower)
                                  # ones on slow hardware/large models.
+AGENTIC_CALL_TIMEOUT=2400       # per-HTTP-call timeout to Ollama (40 min).
+                                 # Worst-case total runtime stacks up to
+                                 # AGENTIC_MAX_SECONDS + 4x this value (see
+                                 # client.py) — at these defaults, ~7h40m.
+                                 # Keep that comfortably under whatever your
+                                 # real "too long" line is (e.g. the ~9h
+                                 # danger zone documented below for
+                                 # OLLAMA_THINK on 14B+ models) when tuning
+                                 # either value.
 UI_HOST=0.0.0.0                 # interface the web UI binds to
 UI_PORT=5000                    # web UI port
 
@@ -142,13 +151,19 @@ http://<host>:5000
   (e.g. `qwen3:8b`). On a 14B+ model, thinking mode has been observed to push
   a single investigation to 9+ hours. Leave it `false` unless you've
   benchmarked your specific model.
-- **A run always ends within `AGENTIC_MAX_SECONDS` (default 1h), even if
-  it hasn't converged.** `AGENTIC_MAX_STEPS` only caps *tool-call count* — it
-  does not bound wall-clock time if individual model calls are slow. Past the
-  time budget, the agent is forced straight to a final answer from whatever
-  evidence it already gathered, same as hitting the step cap. Two markers
-  can appear on a forced answer, and both mean "don't take this as a clean
-  bill of health":
+- **A run always ends within `AGENTIC_MAX_SECONDS` (default 5h) plus up to
+  4x `AGENTIC_CALL_TIMEOUT` (default 40min) on top — ~7h40m worst case at
+  the defaults — even if it hasn't converged.** `AGENTIC_MAX_STEPS` only
+  caps *tool-call count* — it does not bound wall-clock time if individual
+  model calls are slow. The two budgets stack (see the comment above
+  `AGENTIC_CALL_TIMEOUT` in `client.py` for exactly where each use comes
+  from); re-check that math by hand if you change either value — it's not
+  enforced automatically, and getting it wrong is how you end up at the
+  ~9h danger zone below instead of comfortably under it. Past the time
+  budget, the agent is forced straight to a final answer from whatever
+  evidence it already gathered, same as hitting the step cap. Three
+  markers can appear on a forced answer, and all three mean "don't take
+  this as a clean bill of health":
   - `[COVERAGE GAP: ...]` — a rule group it flagged as needing a sample
     (severity >= 12, or `vulnerability-detector`) never got one. Treat that
     specific claim as unconfirmed and re-run `search_alerts(rule_group=...)`
@@ -160,11 +175,20 @@ http://<host>:5000
     the budget cut it off too early for this model/hardware, not that the
     environment is actually clean — raise `AGENTIC_MAX_STEPS` and/or
     `AGENTIC_MAX_SECONDS` and re-run.
-  Lower `AGENTIC_MAX_SECONDS` for a tighter worst-case runtime at the cost of
-  shallower reports; raise it for deeper investigations at the cost of a
-  longer worst case. There's no value that's simultaneously fast and deep on
-  slow hardware — the historical detailed reports on this deployment took
-  ~3h20m to reach get_agent_timeline/get_inventory/per-CVE depth.
+  - `[INVESTIGATION FAILED: ...]` — zero tool calls completed (the very
+    first model call itself errored/timed out). No model call is made to
+    "summarize" this case — there's nothing to summarize — so this text is
+    deterministic, not model-generated. Check Ollama connectivity/load;
+    a cold model load or a busy inference slot exceeding
+    `AGENTIC_CALL_TIMEOUT` on the very first request is the usual cause.
+  Lower `AGENTIC_MAX_SECONDS`/`AGENTIC_CALL_TIMEOUT` for a tighter worst-case
+  runtime at the cost of shallower reports; raise them for deeper
+  investigations at the cost of a longer worst case. There's no value
+  that's simultaneously fast and deep on slow hardware — the historical
+  detailed reports on this deployment took ~3h20m on a 14B model to reach
+  get_agent_timeline/get_inventory/per-CVE depth (an 8B model reaches
+  similar depth considerably faster — worth trying if 14B is too slow on
+  your hardware).
 - **Keep Context-tab notes to durable environment facts, not incident
   details.** The notes text is injected unconditionally into every run's
   system prompt, including scheduled runs days or weeks later. A note like
