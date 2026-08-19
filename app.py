@@ -214,6 +214,13 @@ IOCs, hosts, or severity levels that are not present in the findings text.
 Return ONLY valid JSON — no markdown, no explanation.
 Write every string value in English only, even if the findings text below \
 contains another language.
+Keep every string value CONCISE — this is a compressed summary, not a \
+transcript. "detail" is at most 2 sentences; never quote large verbatim \
+blocks from the findings text. List at most the 10 most severe/important \
+key_findings — if more genuinely distinct issues exist, group the rest into \
+one combined entry (e.g. "12 additional lower-severity CVEs on PC7") rather \
+than enumerating every single one. The output must always be substantially \
+SHORTER than the findings text below, never longer or comparable in length.
 
 QUESTION: {question}
 
@@ -226,7 +233,7 @@ JSON schema (use exactly these keys):
   "severity": "critical|high|medium|low|info",
   "affected_hosts": ["hostname"],
   "key_findings": [
-    {{"title": "short title", "severity": "critical|high|medium|low|info", "detail": "detail"}}
+    {{"title": "short title", "severity": "critical|high|medium|low|info", "detail": "detail, at most 2 sentences"}}
   ],
   "recommendations": ["action item"],
   "iocs": ["ip/hash/username/domain — omit if none"]
@@ -247,12 +254,11 @@ def _generate_structured(question, final, audit):
         return None
     # A long-running investigation (many tool calls, a verbose final synthesis)
     # can produce a `final` text long enough to blow past this call's context
-    # window — unlike the main loop's client.chat(), which sets num_ctx=16384,
-    # this one previously used Ollama's Modelfile default (often 2048-4096),
-    # silently truncating the model's JSON mid-output and making this whole
-    # function return None with no visible error (a missing Formatted/Raw
-    # toggle in the UI is the only symptom). Cap `final` defensively and match
-    # the main loop's context size so a marathon run doesn't kill structuring.
+    # window on the INPUT side — unlike the main loop's client.chat(), which
+    # sets num_ctx=16384, this one previously used Ollama's Modelfile default
+    # (often 2048-4096), silently truncating the model's JSON mid-output.
+    # Cap `final` defensively and match the main loop's context size so a
+    # marathon run doesn't kill structuring.
     if len(final) > 12000:
         final = final[:12000] + "\n...[truncated for structuring]"
     try:
@@ -261,7 +267,18 @@ def _generate_structured(question, final, audit):
             model=ag.C["AGENTIC_MODEL"],
             messages=[{"role": "user",
                        "content": _STRUCT_PROMPT.replace("{question}", question).replace("{final}", final)}],
-            options={"temperature": 0.1, "think": False, "num_ctx": 16384},
+            # num_ctx raised beyond the input cap above to leave real
+            # headroom for the OUTPUT too — a dense report (multiple
+            # findings, CVE lists) can still produce a long JSON blob even
+            # with the prompt now instructing conciseness/a top-10 findings
+            # cap. num_predict is the actual hard backstop: without it,
+            # generation has no ceiling of its own and can run until it
+            # collides with num_ctx, truncating the JSON mid-output and
+            # making this function return None with no visible error (a
+            # missing Formatted/Raw toggle in the UI is the only symptom —
+            # this exact failure mode has been observed twice now).
+            options={"temperature": 0.1, "think": False,
+                     "num_ctx": 24576, "num_predict": 3000},
         )
         text = (resp.get("message") or {}).get("content", "").strip()
         # Strip markdown code fences if the model wraps the JSON
