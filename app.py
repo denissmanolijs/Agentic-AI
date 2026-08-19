@@ -263,24 +263,49 @@ def _generate_structured(question, final, audit):
         final = final[:12000] + "\n...[truncated for structuring]"
     try:
         cl = ollama.Client(host=ag.C["OL_HOST"], timeout=ag.C["AGENTIC_CALL_TIMEOUT"])
-        resp = cl.chat(
-            model=ag.C["AGENTIC_MODEL"],
-            messages=[{"role": "user",
-                       "content": _STRUCT_PROMPT.replace("{question}", question).replace("{final}", final)}],
-            # num_ctx raised beyond the input cap above to leave real
-            # headroom for the OUTPUT too — a dense report (multiple
-            # findings, CVE lists) can still produce a long JSON blob even
-            # with the prompt now instructing conciseness/a top-10 findings
-            # cap. num_predict is the actual hard backstop: without it,
-            # generation has no ceiling of its own and can run until it
-            # collides with num_ctx, truncating the JSON mid-output and
-            # making this function return None with no visible error (a
-            # missing Formatted/Raw toggle in the UI is the only symptom —
-            # this exact failure mode has been observed twice now).
-            options={"temperature": 0.1, "think": False,
-                     "num_ctx": 24576, "num_predict": 3000},
-        )
-        text = (resp.get("message") or {}).get("content", "").strip()
+        prompt = _STRUCT_PROMPT.replace("{question}", question).replace("{final}", final)
+        text = ""
+        for attempt in range(2):
+            resp = cl.chat(
+                model=ag.C["AGENTIC_MODEL"],
+                messages=[{"role": "user", "content": prompt}],
+                # num_ctx raised beyond the input cap above to leave real
+                # headroom for the OUTPUT too — a dense report (multiple
+                # findings, CVE lists) can still produce a long JSON blob
+                # even with the prompt now instructing conciseness/a top-10
+                # findings cap. num_predict is the actual hard backstop:
+                # without it, generation has no ceiling of its own and can
+                # run until it collides with num_ctx, truncating the JSON
+                # mid-output and making this function return None with no
+                # visible error (a missing Formatted/Raw toggle in the UI
+                # is the only symptom — this exact failure mode has been
+                # observed more than once).
+                options={"temperature": 0.1, "think": False,
+                         "num_ctx": 24576, "num_predict": 3000},
+            )
+            msg = resp.get("message") or {}
+            text = (msg.get("content") or "").strip()
+            if not text:
+                # qwen3-family models sometimes still route output into the
+                # "thinking" field even with think=False requested, if the
+                # server/model combination doesn't cleanly honor that flag
+                # for a long, instruction-dense prompt like this one. Fall
+                # back to it before giving up on this attempt entirely —
+                # it may well contain the JSON we actually asked for
+                # (observed in production: content came back len=0).
+                thinking = (msg.get("thinking") or "").strip()
+                if thinking:
+                    log.warning("Structured report: content was empty, "
+                               "using the 'thinking' field instead (%d "
+                               "chars) — model may not be honoring "
+                               "think=False for this prompt", len(thinking))
+                    text = thinking
+            if text:
+                break
+            log.warning("Structured report: model returned a completely "
+                       "empty response with nothing in content or "
+                       "thinking either (attempt %d/2)%s", attempt + 1,
+                       "" if attempt else " — retrying once")
         # Strip markdown code fences if the model wraps the JSON
         if text.startswith("```"):
             text = text.split("```")[1]
