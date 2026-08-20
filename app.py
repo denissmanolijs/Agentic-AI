@@ -228,16 +228,35 @@ FINDINGS:
 {final}
 
 JSON schema (use exactly these keys):
-{{
+{
   "executive_summary": "2-3 sentence plain-text summary",
   "severity": "critical|high|medium|low|info",
   "affected_hosts": ["hostname"],
   "key_findings": [
-    {{"title": "short title", "severity": "critical|high|medium|low|info", "detail": "detail, at most 2 sentences"}}
+    {"title": "short title", "severity": "critical|high|medium|low|info", "detail": "detail, at most 2 sentences"}
   ],
   "recommendations": ["action item"],
   "iocs": ["ip/hash/username/domain — omit if none"]
-}}"""
+}
+
+/no_think"""
+# Single braces above, not doubled — this prompt is built with .replace(),
+# not .format(), so {{/}} was never meaningful escaping here; it was almost
+# certainly left over from an earlier .format()-based version and quietly
+# showed the model an invalid JSON example (literal double braces) as its
+# own schema to follow. Harmless most of the time since models are fairly
+# tolerant of this, but a real inconsistency worth not asking the model to
+# parse through, especially under output pressure (see /no_think above).
+# The options below already pass think=False, but that request was observed
+# being ignored in production (agent.log showed 12000+ chars of genuine
+# step-by-step reasoning — "Okay, let's tackle this..." — in the thinking
+# field, with content left completely empty). Qwen models support a second,
+# more reliable way to disable reasoning: a literal "/no_think" marker
+# inside the message itself, which the chat template — not just the API
+# flag — reads directly. With OLLAMA_THINK=true set for the main
+# investigation loop, this call needs its own explicit opt-out; without
+# it, the model can spend its ENTIRE num_predict budget just thinking and
+# never reach the actual JSON, which is exactly what happened.
 
 _SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 
@@ -261,11 +280,21 @@ def _generate_structured(question, final, audit):
     # marathon run doesn't kill structuring.
     if len(final) > 12000:
         final = final[:12000] + "\n...[truncated for structuring]"
-    try:
-        cl = ollama.Client(host=ag.C["OL_HOST"], timeout=ag.C["AGENTIC_CALL_TIMEOUT"])
-        prompt = _STRUCT_PROMPT.replace("{question}", question).replace("{final}", final)
-        text = ""
-        for attempt in range(2):
+    prompt = _STRUCT_PROMPT.replace("{question}", question).replace("{final}", final)
+
+    # Retry covers the whole "did we get usable JSON" question, not just
+    # "did we get any text at all" — those are different failures. A prior
+    # version only retried on a totally empty response; production showed
+    # that's not enough: 'thinking' can hold real but unfinished reasoning
+    # prose ("Okay, let's tackle this...") that is non-empty yet still not
+    # JSON, because num_predict got consumed entirely by that reasoning
+    # before the model ever reached the actual answer. That case used to
+    # exit the loop immediately (text was non-empty) and fail permanently
+    # at the parse step with no second chance. Now a bad parse also retries.
+    for attempt in range(2):
+        is_last = attempt == 1
+        try:
+            cl = ollama.Client(host=ag.C["OL_HOST"], timeout=ag.C["AGENTIC_CALL_TIMEOUT"])
             resp = cl.chat(
                 model=ag.C["AGENTIC_MODEL"],
                 messages=[{"role": "user", "content": prompt}],
@@ -281,7 +310,7 @@ def _generate_structured(question, final, audit):
                 # is the only symptom — this exact failure mode has been
                 # observed more than once).
                 options={"temperature": 0.1, "think": False,
-                         "num_ctx": 24576, "num_predict": 3000},
+                         "num_ctx": 24576, "num_predict": 4000},
             )
             msg = resp.get("message") or {}
             text = (msg.get("content") or "").strip()
@@ -300,60 +329,73 @@ def _generate_structured(question, final, audit):
                                "chars) — model may not be honoring "
                                "think=False for this prompt", len(thinking))
                     text = thinking
-            if text:
-                break
-            log.warning("Structured report: model returned a completely "
-                       "empty response with nothing in content or "
-                       "thinking either (attempt %d/2)%s", attempt + 1,
-                       "" if attempt else " — retrying once")
-        # Strip markdown code fences if the model wraps the JSON
-        if text.startswith("```"):
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.strip()
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            # Log a preview of what actually came back — the bare exception
-            # message alone ("Expecting value: line 1 column 1") gives no way
-            # to tell truncation, an empty response, and prose-instead-of-JSON
-            # apart after the fact.
-            log.warning("Structured report: model returned non-JSON "
-                       "(len=%d): %r", len(text), text[:300])
+
+            if not text:
+                log.warning("Structured report: model returned a completely "
+                           "empty response with nothing in content or "
+                           "thinking either (attempt %d/2)%s", attempt + 1,
+                           "" if is_last else " — retrying")
+                continue
+
+            # Strip markdown code fences if the model wraps the JSON
+            if text.startswith("```"):
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+                text = text.strip()
+
+            try:
+                data = json.loads(text)
+                if not isinstance(data, dict):
+                    raise ValueError("structured output was not a JSON object")
+            except (json.JSONDecodeError, ValueError):
+                # Log a preview of what actually came back — the bare
+                # exception message alone ("Expecting value: line 1 column
+                # 1") gives no way to tell truncation, an empty response,
+                # and prose-instead-of-JSON (e.g. unfinished reasoning
+                # recovered from 'thinking') apart after the fact.
+                log.warning("Structured report: model returned non-JSON "
+                           "(len=%d): %r (attempt %d/2)%s", len(text),
+                           text[:300], attempt + 1,
+                           "" if is_last else " — retrying")
+                continue
+
+            # The formatting pass sometimes returns valid-but-incomplete JSON
+            # (e.g. severity/affected_hosts/iocs missing entirely) — backfill
+            # so a report never silently renders as blank/absent instead of
+            # what it actually found.
+            data.setdefault("executive_summary", "")
+            data.setdefault("affected_hosts", [])
+            data.setdefault("key_findings", [])
+            data.setdefault("recommendations", [])
+            data.setdefault("iocs", [])
+
+            for f in data["key_findings"]:
+                if isinstance(f, dict):
+                    f["severity"] = _normalize_severity(f.get("severity"))
+
+            # Derive the overall severity from the worst per-finding severity
+            # rather than trusting a second, independent LLM guess for the
+            # top-level field — the same underlying findings were otherwise
+            # coming out as 'high' one run and 'critical' another, because
+            # the model had to infer one word from unstructured prose each
+            # time.
+            finding_sevs = [f["severity"] for f in data["key_findings"] if isinstance(f, dict)]
+            if finding_sevs:
+                data["severity"] = max(finding_sevs, key=lambda s: _SEVERITY_RANK[s])
+            else:
+                data["severity"] = _normalize_severity(data.get("severity"))
+
+            return data
+        except Exception as e:
+            # Any genuinely unexpected failure (network error, timeout, a
+            # bug in the backfill logic above) — degrade gracefully like
+            # before rather than retry; a retry is only useful for the
+            # "got a response but it wasn't usable" cases handled above.
+            log.warning("Structured report generation failed: %s", e)
             return None
-        if not isinstance(data, dict):
-            raise ValueError("structured output was not a JSON object")
 
-        # The formatting pass sometimes returns valid-but-incomplete JSON
-        # (e.g. severity/affected_hosts/iocs missing entirely) — backfill so
-        # a report never silently renders as blank/absent instead of what it
-        # actually found.
-        data.setdefault("executive_summary", "")
-        data.setdefault("affected_hosts", [])
-        data.setdefault("key_findings", [])
-        data.setdefault("recommendations", [])
-        data.setdefault("iocs", [])
-
-        for f in data["key_findings"]:
-            if isinstance(f, dict):
-                f["severity"] = _normalize_severity(f.get("severity"))
-
-        # Derive the overall severity from the worst per-finding severity
-        # rather than trusting a second, independent LLM guess for the
-        # top-level field — the same underlying findings were otherwise
-        # coming out as 'high' one run and 'critical' another, because the
-        # model had to infer one word from unstructured prose each time.
-        finding_sevs = [f["severity"] for f in data["key_findings"] if isinstance(f, dict)]
-        if finding_sevs:
-            data["severity"] = max(finding_sevs, key=lambda s: _SEVERITY_RANK[s])
-        else:
-            data["severity"] = _normalize_severity(data.get("severity"))
-
-        return data
-    except Exception as e:
-        log.warning("Structured report generation failed: %s", e)
-        return None
+    return None   # both attempts produced an empty/unusable response
 
 
 # ── HTML email builder ─────────────────────────────────────────────────────────
