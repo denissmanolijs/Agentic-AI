@@ -85,6 +85,12 @@ C = {
     "SMTP_PASS": os.getenv("SMTP_PASS", ""),
     "SMTP_FROM": os.getenv("SMTP_FROM", ""),
     "SMTP_TO":   os.getenv("SMTP_TO",   ""),
+    # Previously a hardcoded 15s in app.py's _send_email. A report is
+    # already saved to history before email is even attempted, so this
+    # was never a "no report" risk — but a marginal SMTP relay timing out
+    # here means a perfectly good report never actually reaches the SOC
+    # inbox, which is its own kind of "the tool went silent" failure.
+    "SMTP_TIMEOUT": int(os.getenv("SMTP_TIMEOUT", "30")),
 }
 SSL     = os.getenv("WAZUH_SSL","false").lower() == "true"
 MIN_SEV = int(os.getenv("MIN_SEVERITY","3"))

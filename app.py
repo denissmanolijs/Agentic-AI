@@ -150,46 +150,92 @@ def _run_agentic(question, run_id, q=None):
                 q.put(f"\n[error] {e}\n")
             final = f"[error: {e}]"
 
-        # Compose the saved report: the verdict, then the audit trail.
-        audit_text = "\n".join(
-            f"{i+1}. {a['tool']}({json.dumps(a['args'])})" for i, a in enumerate(audit)
-        ) or "(no tool calls recorded)"
-        report = (f"QUESTION: {question}\n\n{final}\n\n"
-                  f"{'─'*50}\nTOOL-CALL AUDIT TRAIL ({len(audit)} calls)\n{'─'*50}\n"
-                  f"{audit_text}")
+        # Everything from here on used to live under one bare try/finally —
+        # any unexpected exception (a bug in report composition, structured
+        # generation, history-saving, or email) would propagate straight
+        # through the finally below and kill this thread silently. The
+        # history entry would stay stuck on "running" forever: no report,
+        # no email, no visible error — a monitoring tool that just skips a
+        # window without telling anyone. Mandatory for a security tool:
+        # every one of these steps gets its own guard, and the history
+        # entry is GUARANTEED to reach a terminal status no matter what
+        # fails partway through.
+        try:
+            # Compose the saved report: the verdict, then the audit trail.
+            audit_text = "\n".join(
+                f"{i+1}. {a['tool']}({json.dumps(a['args'])})" for i, a in enumerate(audit)
+            ) or "(no tool calls recorded)"
+            report = (f"QUESTION: {question}\n\n{final}\n\n"
+                      f"{'─'*50}\nTOOL-CALL AUDIT TRAIL ({len(audit)} calls)\n{'─'*50}\n"
+                      f"{audit_text}")
+        except Exception as e:
+            log.exception("Failed to compose report text for run_id=%s", run_id)
+            report = f"QUESTION: {question}\n\n{final}\n\n[error composing audit trail: {e}]"
 
-        # Generate structured JSON report (second LLM pass; skipped if run was stopped)
+        # Generate structured JSON report (second LLM pass; skipped if run was
+        # stopped). _generate_structured() already catches its own failures
+        # and returns None — this guard is for something unexpected in the
+        # caller-side plumbing, not the LLM call itself.
         structured = None
         if not ag.STOP_FLAG.is_set():
-            structured = _generate_structured(question, final, audit)
+            try:
+                structured = _generate_structured(question, final, audit)
+            except Exception:
+                log.exception("Structured report generation raised "
+                              "unexpectedly for run_id=%s", run_id)
+                structured = None
 
-        with ST.hist_lock:
-            if run_id in ST.history:
-                ST.history[run_id]["status"] = ("stopped" if ag.STOP_FLAG.is_set()
-                                                else "completed")
-                ST.history[run_id]["report"]     = report
-                ST.history[run_id]["structured"] = structured
-                ST.history[run_id]["ended"]      = datetime.now().strftime("%H:%M")
-            while len(ST.history) > 50:
-                ST.history.popitem(last=False)
-            ST._save_history()
+        try:
+            with ST.hist_lock:
+                if run_id in ST.history:
+                    ST.history[run_id]["status"] = ("stopped" if ag.STOP_FLAG.is_set()
+                                                    else "completed")
+                    ST.history[run_id]["report"]     = report
+                    ST.history[run_id]["structured"] = structured
+                    ST.history[run_id]["ended"]      = datetime.now().strftime("%H:%M")
+                while len(ST.history) > 50:
+                    ST.history.popitem(last=False)
+                ST._save_history()
+        except Exception:
+            log.exception("Failed to save history for run_id=%s — retrying "
+                          "with a minimal payload rather than leaving the "
+                          "entry stuck on 'running' with no report at all",
+                          run_id)
+            try:
+                with ST.hist_lock:
+                    if run_id in ST.history:
+                        ST.history[run_id]["status"] = "error"
+                        ST.history[run_id]["report"]  = report
+                        ST.history[run_id]["ended"]   = datetime.now().strftime("%H:%M")
+                    ST._save_history()
+            except Exception:
+                log.exception("Second attempt to save history also failed "
+                              "for run_id=%s — this run will show as stuck; "
+                              "check disk/permissions on the history file",
+                              run_id)
 
         # Auto-email manual runs server-side, mirroring the scheduler's auto_email
         # handling below. A frontend-only trigger (fire after the SSE stream ends)
         # is unreliable across a multi-minute run if the tab is backgrounded/
         # throttled or the SSE connection drops before __DONE__ is delivered.
-        with ST.hist_lock:
-            item = ST.history.get(run_id)
-            want_email = bool(item and item.get("auto_email"))
-        if want_email:
-            ok, err = _send_email(item)
+        try:
             with ST.hist_lock:
-                if run_id in ST.history:
-                    ST.history[run_id]["email_sent"]  = ok
-                    ST.history[run_id]["email_error"] = None if ok else err
-                ST._save_history()
-            if not ok:
-                log.warning("Auto-email failed for %s: %s", run_id, err)
+                item = ST.history.get(run_id)
+                want_email = bool(item and item.get("auto_email"))
+            if want_email:
+                ok, err = _send_email(item)
+                with ST.hist_lock:
+                    if run_id in ST.history:
+                        ST.history[run_id]["email_sent"]  = ok
+                        ST.history[run_id]["email_error"] = None if ok else err
+                    ST._save_history()
+                if not ok:
+                    log.warning("Auto-email failed for %s: %s", run_id, err)
+        except Exception:
+            # The report itself is already saved above regardless of what
+            # happens here — email delivery failing must never look like
+            # the investigation itself failed.
+            log.exception("Auto-email step raised unexpectedly for run_id=%s", run_id)
 
         if q is not None:
             q.put("__DONE__")
@@ -524,7 +570,8 @@ def _send_email(item):
 
     recipients = [r.strip() for r in smtp_to.split(",") if r.strip()]
     try:
-        with smtplib.SMTP(smtp_host, int(smtp_port), timeout=15) as s:
+        with smtplib.SMTP(smtp_host, int(smtp_port),
+                          timeout=ag.C["SMTP_TIMEOUT"]) as s:
             s.ehlo()
             s.starttls()
             if smtp_user:

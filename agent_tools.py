@@ -1051,6 +1051,35 @@ def run_agent(question: str, agent_id: str = None, emit=None, context=None):
     MAX_NUDGES    = 1   # cap forced retries — narrow guardrail scope (below)
                         # already keeps this cheap, so one retry is enough
     start_ts      = time.time()
+    # A forced cutoff (step or time budget) with very few tool calls behind
+    # it produces a verdict built on almost no evidence — the system prompt
+    # normally expects 6-10 calls to reach a real conclusion. Used at every
+    # exit point (see _stamp_gaps below), not just the forced-cutoff one —
+    # a model can dodge a check that only fires on a forced cutoff simply
+    # by choosing to stop voluntarily instead.
+    SHALLOW_CALL_THRESHOLD = 4
+
+    def _stamp_gaps(answer, audit, pending_drill):
+        """Append deterministic (Python-generated, not model-generated)
+        markers when an answer isn't backed by real investigation. Shared
+        between the voluntary "model decided to conclude" exit and the
+        forced step/time-cap exit, so neither path can slip through
+        unflagged just because of *which* way the loop ended."""
+        if audit and len(audit) < SHALLOW_CALL_THRESHOLD:
+            answer += (f"\n\n[SHALLOW INVESTIGATION: only {len(audit)} tool "
+                      "call(s) were made — well under the 6-10 typically "
+                      "needed to reach a real verdict. Treat the assessment "
+                      "above as PRELIMINARY, not a validated clean result.]")
+        if pending_drill:
+            gaps = ", ".join(f"{g} (max severity {lvl})"
+                             for g, lvl in pending_drill.items())
+            answer += (f"\n\n[COVERAGE GAP: rule group(s) {gaps} appeared "
+                      "in aggregate_alerts results but were never sampled "
+                      "with a follow-up search_alerts/get_vulnerabilities "
+                      "call. Treat any severity claim for these groups as "
+                      "UNCONFIRMED and re-run search_alerts(rule_group=...) "
+                      "on them manually.]")
+        return answer
 
     for step in range(MAX_STEPS):
         if ag.STOP_FLAG.is_set():
@@ -1100,40 +1129,59 @@ def run_agent(question: str, agent_id: str = None, emit=None, context=None):
             answer = msg.content or "(no answer)"
 
             # ── Enforce the coverage guardrail before accepting "done" ──────
-            if (pending_drill and nudge_count < MAX_NUDGES
+            # Nudge on EITHER of two problems: undrilled high-severity groups
+            # (pending_drill), OR zero tool calls made at all. The second
+            # case matters on its own — pending_drill can only ever contain
+            # something once an aggregate_alerts call has actually run, so a
+            # model that concludes on its very first turn without calling
+            # any tool sails past the pending_drill check with nothing to
+            # flag, even though "no alerts in 48h" with zero verification is
+            # far worse than an unsampled group. Observed in production: a
+            # scheduled run came back "no alerts detected... no actionable
+            # findings" with no evidence cited at all — not even the routine
+            # high-volume noise (office365/windows/sophos) every other
+            # report shows — consistent with zero tool calls ever happening.
+            needs_nudge = bool(pending_drill) or not audit
+            if (needs_nudge and nudge_count < MAX_NUDGES
                     and step < MAX_STEPS - 1
                     and (time.time() - start_ts) < MAX_SECONDS):
                 nudge_count += 1
-                todo = ", ".join(f"{g} (max severity {lvl})"
-                                 for g, lvl in pending_drill.items())
-                _emit("thinking", f"[guardrail] refusing to conclude — "
-                                  f"undrilled high-severity group(s): {todo}")
+                asks = []
+                if not audit:
+                    asks.append("you have not called any tool yet — before "
+                               "concluding anything, call "
+                               "aggregate_alerts(group_by='rule.groups') to "
+                               "see what activity actually exists in this "
+                               "window")
+                if pending_drill:
+                    todo = ", ".join(f"{g} (max severity {lvl})"
+                                     for g, lvl in pending_drill.items())
+                    asks.append(f"aggregate_alerts showed {todo} which you "
+                               "have not pulled samples for — call "
+                               "search_alerts(rule_group=<exact group name>) "
+                               "for each non-vulnerability group, and "
+                               "get_vulnerabilities() if 'vulnerability-"
+                               "detector' is listed")
+                nudge_msg = ("Before concluding: " + "; also, ".join(asks) +
+                            ". Do not conclude 'no alerts'/'nothing found' "
+                            "without having actually checked.")
+                _emit("thinking", f"[guardrail] refusing to conclude — {nudge_msg}")
                 messages.append({"role": "assistant", "content": answer})
-                messages.append({"role": "user", "content":
-                    f"Before concluding: aggregate_alerts showed {todo} which "
-                    "you have not pulled samples for. Call "
-                    "search_alerts(rule_group=<exact group name>) for each "
-                    "non-vulnerability group, and get_vulnerabilities() if "
-                    "'vulnerability-detector' is listed, before writing your "
-                    "final answer."})
+                messages.append({"role": "user", "content": nudge_msg})
                 continue
 
-            if pending_drill:
-                # Nudges exhausted or step budget ran out with the gap still
-                # open. Don't let that go out as a silent, confident verdict —
-                # stamp it into the answer deterministically (this text is
-                # Python-generated, not model-generated) so both the human
-                # analyst and the structured-report pass downstream see any
-                # severity claim tied to these groups as explicitly unconfirmed.
-                gaps = ", ".join(f"{g} (max severity {lvl})"
-                                 for g, lvl in pending_drill.items())
-                answer += (f"\n\n[COVERAGE GAP: rule group(s) {gaps} appeared "
-                          "in aggregate_alerts results but were never sampled "
-                          "with a follow-up search_alerts/get_vulnerabilities "
-                          "call before this investigation concluded. Treat any "
-                          "severity claim for these groups as UNCONFIRMED and "
-                          "re-run search_alerts(rule_group=...) on them "
-                          "manually.]")
+            if not audit:
+                # Nudge exhausted (or none available) and still zero tool
+                # calls — the model is choosing to answer with no
+                # verification at all, not just under-verifying. Stronger,
+                # distinct wording from SHALLOW INVESTIGATION on purpose:
+                # this is a compliance problem (ignored the nudge / the
+                # system prompt's own instructions), not a budget problem.
+                answer += ("\n\n[NO INVESTIGATION PERFORMED: this verdict "
+                          "was written without calling a single tool — "
+                          "nothing was actually checked. This is NOT a "
+                          "validated clean result. Re-run this question.]")
+            answer = _stamp_gaps(answer, audit, pending_drill)
 
             _emit("answer", answer)
             _emit("done", {"steps": step, "audit": audit})
@@ -1276,24 +1324,10 @@ def run_agent(question: str, agent_id: str = None, emit=None, context=None):
     # like a thorough clean result instead of a rushed, mostly-unexplored
     # one. Flag that distinction explicitly rather than let a shallow pass
     # masquerade as a validated all-clear. (audit is non-empty here — the
-    # audit == 0 case returned early above with a stronger message.)
-    SHALLOW_CALL_THRESHOLD = 4
-    if len(audit) < SHALLOW_CALL_THRESHOLD:
-        answer += (f"\n\n[SHALLOW INVESTIGATION: only {len(audit)} tool call(s) "
-                  "completed before the step/time budget was reached — well "
-                  "under the 6-10 typically needed to reach a real verdict. "
-                  "Treat the assessment above as PRELIMINARY, not a validated "
-                  "clean result. Re-run this question, or raise "
-                  "AGENTIC_MAX_STEPS/AGENTIC_MAX_SECONDS if this keeps "
-                  "happening.]")
-    if pending_drill:
-        gaps = ", ".join(f"{g} (max severity {lvl})"
-                         for g, lvl in pending_drill.items())
-        answer += (f"\n\n[COVERAGE GAP: rule group(s) {gaps} appeared in "
-                  "aggregate_alerts results but were never sampled before the "
-                  "step limit was reached. Treat any severity claim for these "
-                  "groups as UNCONFIRMED and re-run "
-                  "search_alerts(rule_group=...) on them manually.]")
+    # audit == 0 case returned early above with a stronger message; shares
+    # SHALLOW_CALL_THRESHOLD/_stamp_gaps with the voluntary-conclusion exit
+    # above so both paths apply the same bar.)
+    answer = _stamp_gaps(answer, audit, pending_drill)
     _emit("answer", answer)
     _emit("done", {"steps": len(audit), "audit": audit, "capped": True,
                    "elapsed_seconds": int(time.time() - start_ts)})

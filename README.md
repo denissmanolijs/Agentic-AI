@@ -85,6 +85,11 @@ SMTP_USER=
 SMTP_PASS=
 SMTP_FROM=
 SMTP_TO=
+SMTP_TIMEOUT=30                 # seconds; raise if your relay is slow —
+                                 # the report is already saved to history
+                                 # before this is even attempted, so this
+                                 # only affects whether the email itself
+                                 # arrives, not whether the report exists
 ```
 
 Notes:
